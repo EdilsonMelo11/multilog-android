@@ -1,0 +1,50 @@
+name: Gerar APK Android (MULTILOG)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configurar Java 17 (Android Build)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configurar Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Instalar Flet CLI
+        run: |
+          pip install --upgrade pip
+          pip install "flet[all]>=0.24.0"
+
+      - name: Compilar APK Android
+        run: |
+          if [ -d "Projeto_Android" ]; then
+            cd Projeto_Android
+          fi
+          rm -rf .venv build
+          flet build apk --yes
+
+      - name: Publicar APK Gerado como Artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: multilog-android-apk
+          path: |
+            Projeto_Android/build/apk/*.apk
+            build/apk/*.apk
