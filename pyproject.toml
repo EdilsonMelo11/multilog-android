@@ -1,0 +1,32 @@
+[project]
+name = "multilog-android"
+version = "1.0.0"
+description = "MULTILOG · Gestão Inteligente de Estoque Pick-to-Light para Android"
+readme = "COMO_GERAR_APK.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Multilog Team" }
+]
+dependencies = [
+    "flet>=0.24.0"
+]
+
+[tool.flet]
+org = "com.multilog"
+product = "MULTILOG Estoque"
+company = "MULTILOG"
+copyright = "Copyright (C) 2026 by MULTILOG"
+
+[tool.flet.app]
+path = "."
+exclude = [".venv", ".pytest_cache", "__pycache__", "build", "tests", "firmware_esp32_wifi"]
+
+[tool.flet.android]
+# Permite tráfego HTTP local (ex: http://192.168.4.1) para comunicação direta via Wi-Fi com o ESP32
+manifest_application = { usesCleartextTraffic = "true" }
+permission = [
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.ACCESS_WIFI_STATE"
+]
+
