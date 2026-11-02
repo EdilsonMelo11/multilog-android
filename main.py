@@ -2815,7 +2815,10 @@ class MultilogMobileApp:
     def _construir_tela_ordens(self) -> ft.Control:
         filtro_op = None if self.usuario_role == "ADMIN" else self.funcionario_id
         ordens_brutas = database.get_ordens_servico_abertas(filtro_op)
-        ordens = logic.ordenar_ordens_servico(ordens_brutas, self.ordenacao_os)
+        if hasattr(logic, "ordenar_ordens_servico"):
+            ordens = logic.ordenar_ordens_servico(ordens_brutas, self.ordenacao_os)
+        else:
+            ordens = list(ordens_brutas or [])
 
         opcoes_ord = [
             ("RECENTE", "🕒 Recente"),

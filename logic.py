@@ -98,3 +98,40 @@ def validar_operacao_os(item_os: Dict[str, Any], tipo_operacao: str, quantidade:
         
     return True, "OK"
 
+
+def ordenar_ordens_servico(ordens: list, criterio: str = "RECENTE") -> list:
+    """
+    Ordena/agrupa uma lista de Ordens de Serviço conforme o critério selecionado:
+    - 'RECENTE': Da mais recente para a mais antiga (data_criacao / id decrescente)
+    - 'ANTIGA': Da mais antiga para a mais recente (data_criacao / id crescente)
+    - 'AZ': Ordem alfabética A-Z pelo título da O.S.
+    - 'ZA': Ordem alfabética Z-A pelo título da O.S.
+    """
+    crit = (criterio or "RECENTE").strip().upper()
+    lista = list(ordens or [])
+    if crit == "ANTIGA":
+        return sorted(
+            lista,
+            key=lambda o: ((o.get("data_criacao") or ""), int(o.get("id") or 0)),
+            reverse=False,
+        )
+    if crit == "AZ":
+        return sorted(
+            lista,
+            key=lambda o: ((o.get("titulo") or "").strip().casefold(), int(o.get("id") or 0)),
+            reverse=False,
+        )
+    if crit == "ZA":
+        return sorted(
+            lista,
+            key=lambda o: (o.get("titulo") or "").strip().casefold(),
+            reverse=True,
+        )
+    # Padrão: RECENTE (mais recente primeiro)
+    return sorted(
+        lista,
+        key=lambda o: ((o.get("data_criacao") or ""), int(o.get("id") or 0)),
+        reverse=True,
+    )
+
+
