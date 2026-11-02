@@ -239,12 +239,12 @@ def init_db() -> None:
     )
     ''')
     
-    # Migração: garante que a Estante A (5x5) exista como estante padrão (id=1)
+    # Migração: garante que a Estante Principal (2x3) exista como estante padrão (id=1)
     cursor.execute("SELECT COUNT(*) FROM estantes")
     if cursor.fetchone()[0] == 0:
         cursor.execute('''
         INSERT INTO estantes (id, nome, linhas, colunas, descricao)
-        VALUES (1, 'Estante A', 5, 5, 'Estante Principal de Componentes (5x5)')
+        VALUES (1, 'Estante Principal (2x3)', 2, 3, 'Estante Física Principal (2x3)')
         ''')
 
     # Migração: garante que a coluna quantidade_estoque exista em bancos antigos
@@ -447,37 +447,213 @@ def get_peca_por_rfid(rfid_uid: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def vincular_rfid_peca(peca_id: int, rfid_uid: str) -> None:
-    """Vincula ou atualiza o UID RFID de uma peça existente."""
+def verificar_disponibilidade_rfid_peca(rfid_uid: str, ignorar_peca_id: Optional[int] = None) -> Tuple[bool, str]:
+    """
+    Verifica se a tag RFID pode ser associada a uma peça:
+    Cada RFID só pode estar linkado a exatamente uma única peça (e não pode pertencer a crachá de funcionário).
+    """
     uid_limpo = formatar_rfid_uid(rfid_uid)
+    if not uid_limpo:
+        return True, ""
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if ignorar_peca_id is not None:
+        cursor.execute(
+            "SELECT id, nome FROM pecas WHERE UPPER(TRIM(rfid_uid)) = ? AND id != ?",
+            (uid_limpo, ignorar_peca_id),
+        )
+    else:
+        cursor.execute(
+            "SELECT id, nome FROM pecas WHERE UPPER(TRIM(rfid_uid)) = ?",
+            (uid_limpo,),
+        )
+    row_p = cursor.fetchone()
+    if row_p:
+        conn.close()
+        return False, f"Tag RFID '{uid_limpo}' já está vinculada à peça '{row_p['nome']}' (#{row_p['id']})! Cada RFID só pode ser linkado a uma única peça."
+
+    cursor.execute(
+        "SELECT id, nome FROM usuarios WHERE UPPER(TRIM(rfid_uid)) = ?",
+        (uid_limpo,),
+    )
+    row_u = cursor.fetchone()
+    conn.close()
+    if row_u:
+        return False, f"Tag RFID '{uid_limpo}' já está vinculada ao crachá do colaborador '{row_u['nome']}' (ID #{row_u['id']})!"
+
+    return True, ""
+
+
+def verificar_disponibilidade_rfid_usuario(rfid_uid: str, ignorar_user_id: Optional[str] = None) -> Tuple[bool, str]:
+    """Verifica se a tag RFID pode ser associada a um crachá de funcionário."""
+    uid_limpo = formatar_rfid_uid(rfid_uid)
+    if not uid_limpo:
+        return True, ""
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if ignorar_user_id is not None:
+        cursor.execute(
+            "SELECT id, nome FROM usuarios WHERE UPPER(TRIM(rfid_uid)) = ? AND id != ?",
+            (uid_limpo, str(ignorar_user_id)),
+        )
+    else:
+        cursor.execute(
+            "SELECT id, nome FROM usuarios WHERE UPPER(TRIM(rfid_uid)) = ?",
+            (uid_limpo,),
+        )
+    row_u = cursor.fetchone()
+    if row_u:
+        conn.close()
+        return False, f"Tag RFID '{uid_limpo}' já está vinculada ao crachá de '{row_u['nome']}' (ID #{row_u['id']})!"
+
+    cursor.execute(
+        "SELECT id, nome FROM pecas WHERE UPPER(TRIM(rfid_uid)) = ?",
+        (uid_limpo,),
+    )
+    row_p = cursor.fetchone()
+    conn.close()
+    if row_p:
+        return False, f"Tag RFID '{uid_limpo}' já está vinculada à peça '{row_p['nome']}' (#{row_p['id']})! Cada RFID é exclusivo."
+
+    return True, ""
+
+
+def vincular_rfid_peca(peca_id: int, rfid_uid: str) -> Tuple[bool, str]:
+    """Vincula ou atualiza o UID RFID de uma peça existente, garantindo que seja exclusivo."""
+    uid_limpo = formatar_rfid_uid(rfid_uid)
+    if uid_limpo:
+        disponivel, msg = verificar_disponibilidade_rfid_peca(uid_limpo, ignorar_peca_id=peca_id)
+        if not disponivel:
+            return False, msg
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    if uid_limpo:
-        cursor.execute(
-            "UPDATE pecas SET rfid_uid = '' WHERE UPPER(TRIM(rfid_uid)) = ? AND id != ?",
-            (uid_limpo, peca_id),
-        )
     cursor.execute("UPDATE pecas SET rfid_uid = ? WHERE id = ?", (uid_limpo, peca_id))
     conn.commit()
     conn.close()
+    return True, "Tag RFID vinculada com sucesso."
 
 def get_todas_pecas() -> List[Dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pecas")
+    cursor.execute('''
+        SELECT p.*, e.nome AS estante_nome
+        FROM pecas p
+        LEFT JOIN estantes e ON p.estante_id = e.id
+        ORDER BY p.nome ASC
+    ''')
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
-def upsert_peca(peca_data: Dict[str, Any]) -> None:
+def cadastrar_peca_catalogo(
+    nome: str,
+    tipo: str,
+    peso_unitario_g: float,
+    dimensoes: str = "Padrão",
+    rfid_uid: str = "",
+    descricao: str = "",
+) -> int:
+    """Cadastra uma nova peça na lista/catálogo mestre de peças (sem vínculo obrigatório com gaveta)."""
+    nome_limpo = (nome or "").strip()
+    if not nome_limpo:
+        raise ValueError("O nome da peça não pode ser vazio.")
+    if peso_unitario_g <= 0:
+        raise ValueError("O peso unitário deve ser maior que zero.")
+
+    uid_limpo = formatar_rfid_uid(rfid_uid)
+    if uid_limpo:
+        disponivel, msg = verificar_disponibilidade_rfid_peca(uid_limpo)
+        if not disponivel:
+            raise ValueError(msg)
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    cursor.execute("SELECT MAX(id) FROM pecas")
+    max_id = cursor.fetchone()[0] or 100
+    novo_id = max(max_id + 1, 101)
+
+    cursor.execute('''
+        INSERT INTO pecas (id, nome, tipo, posicao_linha, posicao_coluna, peso_unitario_g, dimensoes, descricao, quantidade_estoque, estante_id, rfid_uid)
+        VALUES (?, ?, ?, -1, -1, ?, ?, ?, 0, NULL, ?)
+    ''', (novo_id, nome_limpo, tipo, peso_unitario_g, dimensoes or "Padrão", descricao or "", uid_limpo))
+    conn.commit()
+    conn.close()
+    return novo_id
+
+def alocar_peca_na_estante(
+    peca_id: int,
+    estante_id: int,
+    posicao_linha: int,
+    posicao_coluna: int,
+    quantidade_inicial: int = 10,
+) -> None:
+    """Vincula uma peça cadastrada do catálogo a uma gaveta específica de uma estante."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Se outra peça estiver nesta mesma gaveta desta estante, desaloca ela para liberar o slot
+    cursor.execute('''
+        UPDATE pecas
+        SET estante_id = NULL, posicao_linha = -1, posicao_coluna = -1
+        WHERE estante_id = ? AND posicao_linha = ? AND posicao_coluna = ? AND id != ?
+    ''', (estante_id, posicao_linha, posicao_coluna, peca_id))
+
+    cursor.execute('''
+        UPDATE pecas
+        SET estante_id = ?, posicao_linha = ?, posicao_coluna = ?, quantidade_estoque = ?
+        WHERE id = ?
+    ''', (estante_id, posicao_linha, posicao_coluna, max(0, quantidade_inicial), peca_id))
+    conn.commit()
+    conn.close()
+
+def desalocar_peca_da_estante(peca_id: int) -> Tuple[bool, str]:
+    """
+    Remove a peça da gaveta física da estante (liberando a gaveta),
+    mas mantém o cadastro da peça no catálogo geral do sistema.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT COUNT(*) FROM itens_ordem_servico ios
+        JOIN ordens_servico os ON ios.ordem_id = os.id
+        WHERE ios.peca_id = ? AND os.status = 'ABERTA'
+    ''', (peca_id,))
+    em_os_aberta = cursor.fetchone()[0]
+    if em_os_aberta > 0:
+        conn.close()
+        return False, "Esta peça está vinculada a uma Ordem de Serviço aberta e a gaveta não pode ser desocupada agora."
+
+    cursor.execute('''
+        UPDATE pecas
+        SET estante_id = NULL, posicao_linha = -1, posicao_coluna = -1, quantidade_estoque = 0
+        WHERE id = ?
+    ''', (peca_id,))
+    conn.commit()
+    conn.close()
+    return True, "Gaveta desocupada com sucesso! A peça permanece cadastrada no catálogo."
+
+def upsert_peca(peca_data: Dict[str, Any]) -> None:
+    peca_id = peca_data['id']
     descricao = peca_data.get('descricao', '')
-    estante_id = peca_data.get('estante_id', 1)
-    rfid_uid = peca_data.get('rfid_uid', '')
+    estante_id = peca_data.get('estante_id')
+    rfid_uid = formatar_rfid_uid(peca_data.get('rfid_uid', ''))
+
+    if rfid_uid:
+        disponivel, msg = verificar_disponibilidade_rfid_peca(rfid_uid, ignorar_peca_id=peca_id)
+        if not disponivel:
+            raise ValueError(msg)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    cursor.execute("SELECT id FROM pecas WHERE id = ?", (peca_data['id'],))
+    cursor.execute("SELECT id FROM pecas WHERE id = ?", (peca_id,))
     row = cursor.fetchone()
     if row:
         cursor.execute('''
@@ -495,10 +671,10 @@ def upsert_peca(peca_data: Dict[str, Any]) -> None:
         ''', (
             peca_data.get('nome', 'Desconhecido'),
             peca_data['tipo'],
-            peca_data['posicao_linha'],
-            peca_data['posicao_coluna'],
+            peca_data.get('posicao_linha', -1),
+            peca_data.get('posicao_coluna', -1),
             peca_data['peso_unitario_g'],
-            peca_data['dimensoes'],
+            peca_data.get('dimensoes', 'Padrão'),
             descricao,
             estante_id,
             rfid_uid,
@@ -512,10 +688,10 @@ def upsert_peca(peca_data: Dict[str, Any]) -> None:
             peca_data['id'],
             peca_data.get('nome', 'Desconhecido'),
             peca_data['tipo'],
-            peca_data['posicao_linha'],
-            peca_data['posicao_coluna'],
+            peca_data.get('posicao_linha', -1),
+            peca_data.get('posicao_coluna', -1),
             peca_data['peso_unitario_g'],
-            peca_data['dimensoes'],
+            peca_data.get('dimensoes', 'Padrão'),
             descricao,
             estante_id,
             rfid_uid
@@ -668,10 +844,10 @@ def upsert_usuario(
 
     uid_limpo = formatar_rfid_uid(rfid_uid) if rfid_uid is not None else None
     if uid_limpo:
-        # Garante que uma mesma tag RFID não fique duplicada em dois usuários diferentes
-        cursor.execute("UPDATE usuarios SET rfid_uid = '' WHERE UPPER(TRIM(rfid_uid)) = ? AND id != ?", (uid_limpo, user_id))
-        # E também desvincula de eventuais peças de teste antigas para evitar conflito
-        cursor.execute("UPDATE pecas SET rfid_uid = '' WHERE UPPER(TRIM(rfid_uid)) = ?", (uid_limpo,))
+        disponivel, msg = verificar_disponibilidade_rfid_usuario(uid_limpo, ignorar_user_id=user_id)
+        if not disponivel:
+            conn.close()
+            raise ValueError(msg)
 
     cursor.execute("SELECT id, rfid_uid, foto_path FROM usuarios WHERE id = ?", (user_id,))
     existente = cursor.fetchone()
@@ -1096,7 +1272,7 @@ def get_extrato_caixas_por_dia(data_str: str, estante_id: int = 1, incluir_vazia
     num_linhas = estante_row['linhas'] if estante_row else 5
     num_colunas = estante_row['colunas'] if estante_row else 5
     
-    cursor.execute("SELECT * FROM pecas WHERE estante_id = ?", (estante_id,))
+    cursor.execute("SELECT * FROM pecas WHERE estante_id = ? AND posicao_linha >= 0 AND posicao_coluna >= 0", (estante_id,))
     pecas_rows = cursor.fetchall()
     mapa_pecas = {(p['posicao_linha'], p['posicao_coluna']): dict(p) for p in pecas_rows}
     
@@ -1279,7 +1455,7 @@ def validar_redimensionamento_estante(estante_id: int, novas_linhas: int, novas_
     cursor = conn.cursor()
     cursor.execute('''
     SELECT nome, posicao_linha, posicao_coluna FROM pecas
-    WHERE estante_id = ? AND (posicao_linha >= ? OR posicao_coluna >= ?)
+    WHERE estante_id = ? AND posicao_linha >= 0 AND posicao_coluna >= 0 AND (posicao_linha >= ? OR posicao_coluna >= ?)
     ''', (estante_id, novas_linhas, novas_colunas))
     rows = cursor.fetchall()
     conn.close()
@@ -1297,11 +1473,11 @@ def excluir_estante(estante_id: int) -> Tuple[bool, str]:
         conn.close()
         return False, "Não é possível excluir a única estante do armazém."
         
-    cursor.execute("SELECT COUNT(*) FROM pecas WHERE estante_id = ?", (estante_id,))
+    cursor.execute("SELECT COUNT(*) FROM pecas WHERE estante_id = ? AND posicao_linha >= 0 AND posicao_coluna >= 0", (estante_id,))
     total_pecas = cursor.fetchone()[0]
     if total_pecas > 0:
         conn.close()
-        return False, f"Não é possível excluir: existem {total_pecas} peça(s) cadastradas nesta estante. Esvazie-a antes de excluir."
+        return False, f"Não é possível excluir: existem {total_pecas} peça(s) alocadas nesta estante. Esvazie as gavetas antes de excluir."
         
     cursor.execute("SELECT COUNT(*) FROM ordens_servico WHERE estante_id = ? AND status = 'ABERTA'", (estante_id,))
     total_os = cursor.fetchone()[0]
@@ -1318,7 +1494,7 @@ def get_pecas_por_estante(estante_id: int) -> List[Dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pecas WHERE estante_id = ?", (estante_id,))
+    cursor.execute("SELECT * FROM pecas WHERE estante_id = ? AND posicao_linha >= 0 AND posicao_coluna >= 0", (estante_id,))
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]

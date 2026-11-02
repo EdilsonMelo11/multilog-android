@@ -1,4 +1,5 @@
 import os
+import inspect
 import shutil
 import threading
 import time
@@ -31,9 +32,11 @@ ACCENT_EMERALD = "#10B981"
 ACCENT_AMBER = "#F59E0B"
 ACCENT_ROSE = "#EF4444"
 
-# Dimensões verticais em proporção exata 20:9 (9:20 retrato smartphone Android)
-VIEWPORT_WIDTH_20_9 = 378
-VIEWPORT_HEIGHT_20_9 = 840
+# Dimensões verticais Samsung Galaxy S22 (Proporção 19.5:9 · 1080x2340 nativo / 360x780 dp)
+VIEWPORT_WIDTH_S22 = 360
+VIEWPORT_HEIGHT_S22 = 780
+VIEWPORT_WIDTH_20_9 = VIEWPORT_WIDTH_S22
+VIEWPORT_HEIGHT_20_9 = VIEWPORT_HEIGHT_S22
 
 
 def _pasta_fotos_funcionarios() -> str:
@@ -178,7 +181,7 @@ def _btn(
 class MultilogMobileApp:
     def __init__(self, page: ft.Page):
         self.page = page
-        self.page.title = "MULTILOG · Android (20:9)"
+        self.page.title = "MULTILOG · Android (Galaxy S22 19.5:9)"
         self.page.bgcolor = BG_APP
         self.page.padding = 0
         try:
@@ -186,16 +189,16 @@ class MultilogMobileApp:
         except Exception:
             pass
 
-        # Configura tela na vertical com aspecto 20:9 (378x840)
+        # Configura tela na vertical com aspecto 19.5:9 do Galaxy S22 (360x780 dp)
         try:
             if hasattr(self.page, "window") and self.page.window is not None:
-                self.page.window.width = VIEWPORT_WIDTH_20_9
-                self.page.window.height = VIEWPORT_HEIGHT_20_9
-                self.page.window.min_width = 340
-                self.page.window.min_height = 680
+                self.page.window.width = VIEWPORT_WIDTH_S22
+                self.page.window.height = VIEWPORT_HEIGHT_S22
+                self.page.window.min_width = 320
+                self.page.window.min_height = 640
             else:
-                self.page.window_width = VIEWPORT_WIDTH_20_9
-                self.page.window_height = VIEWPORT_HEIGHT_20_9
+                self.page.window_width = VIEWPORT_WIDTH_S22
+                self.page.window_height = VIEWPORT_HEIGHT_S22
         except Exception:
             pass
 
@@ -223,6 +226,8 @@ class MultilogMobileApp:
         self.slot_ativo_os: Optional[Tuple[int, int]] = None
         self.rfid_os_obrigatorio: bool = True
         self.rfid_os_validado: bool = False
+        self.ordenacao_os: str = "RECENTE"  # RECENTE | ANTIGA | AZ | ZA
+        self.filtro_busca_catalogo: str = ""
 
         # Pisca-pisca (500ms) da posição ativa na Estante durante O.S.
         self.blink_state: bool = False
@@ -234,7 +239,24 @@ class MultilogMobileApp:
         self.campo_rfid_modal_ativo: Optional[ft.TextField] = None
         self.campo_nome_modal_ativo: Optional[ft.TextField] = None
         self.campo_peso_modal_ativo: Optional[ft.TextField] = None
+        self.id_peca_modal_ativo: Optional[int] = None
+        self.modal_movimentacao_peca_ativa: Optional[Dict[str, Any]] = None
         self.callback_rfid_tela_usuarios: Optional[Any] = None
+        self.callback_foto_dispositivo: Optional[Any] = None
+
+        # Seletor nativo de arquivos/galeria do dispositivo (Android / Desktop)
+        self.file_picker: Optional[Any] = None
+        if hasattr(ft, "FilePicker"):
+            try:
+                self.file_picker = ft.FilePicker(on_result=self._on_file_picker_result)
+                if hasattr(self.page, "services") and isinstance(self.page.services, list):
+                    if self.file_picker not in self.page.services:
+                        self.page.services.append(self.file_picker)
+                elif hasattr(self.page, "overlay") and isinstance(self.page.overlay, list):
+                    if self.file_picker not in self.page.overlay:
+                        self.page.overlay.append(self.file_picker)
+            except Exception:
+                self.file_picker = None
 
         # Inicializa Hardware Wi-Fi/Serial (ESP32 - RFID, Balança, Buzzer e Display LCD 16x2)
         self.hw = hardware_manager.HardwareManager.get_instancia()
@@ -270,15 +292,48 @@ class MultilogMobileApp:
     def _resolver_nome_rfid_para_lcd(self, tag: str) -> Optional[str]:
         """
         Retorna texto personalizado para a 2ª linha do LCD 16x2 do ESP32 conforme a tela/modal aberto:
+        - Durante O.S.: se a tag não é a da peça correspondente -> 'Tag Incorreta!'
+        - Em modal de movimentação: se a tag não é a da peça -> 'Tag Incorreta!'
+        - Em estante com gaveta selecionada: se a tag não é a da gaveta -> 'Tag Incorreta!'
         - Modal de cadastro de peça: nome digitado ou 'Tag Lida (Novo)'
         - Tela de gestão de usuários: 'ID:<nome>' ou 'Cracha Lido'
         - Sessão já ativa fora da tela de login e tag de colaborador: 'Saia p/ Login'
         """
         try:
+            tag_fmt = database.formatar_rfid_uid(tag)
+
+            if self.os_ativa and self.item_os_selecionado:
+                peca_ativa = database.get_peca(self.item_os_selecionado["peca_id"])
+                if peca_ativa:
+                    rfid_esp = (peca_ativa.get("rfid_uid") or "").strip()
+                    if rfid_esp:
+                        if tag_fmt == rfid_esp:
+                            return peca_ativa["nome"]
+                        return "Tag Incorreta!"
+
+            if getattr(self, "modal_movimentacao_peca_ativa", None) is not None:
+                peca_mov = self.modal_movimentacao_peca_ativa
+                rfid_esp = (peca_mov.get("rfid_uid") or "").strip()
+                if rfid_esp:
+                    if tag_fmt == rfid_esp:
+                        return peca_mov["nome"]
+                    return "Tag Incorreta!"
+
+            if self.aba_atual == "estoque" and self.slot_selecionado is not None and not self.os_ativa:
+                r, c = self.slot_selecionado
+                pecas_est = database.get_pecas_por_estante(self.estante_ativa_id)
+                peca_gaveta = next((p for p in pecas_est if p["posicao_linha"] == r and p["posicao_coluna"] == c), None)
+                if peca_gaveta:
+                    rfid_esp = (peca_gaveta.get("rfid_uid") or "").strip()
+                    if rfid_esp:
+                        if tag_fmt == rfid_esp:
+                            return peca_gaveta["nome"]
+                        return "Tag Incorreta!"
+
             if self.campo_rfid_modal_ativo is not None:
                 if self.campo_nome_modal_ativo is not None and (self.campo_nome_modal_ativo.value or "").strip():
                     return self.campo_nome_modal_ativo.value.strip()
-                peca_db = database.get_peca_por_rfid(tag)
+                peca_db = database.get_peca_por_rfid(tag_fmt)
                 if peca_db and peca_db.get("nome"):
                     return peca_db["nome"]
                 return "Tag Lida (Novo)"
@@ -289,9 +344,14 @@ class MultilogMobileApp:
                 return "Cracha Lido"
 
             if self.aba_atual != "login" and self.funcionario_id:
-                usr = database.get_usuario_por_rfid(tag)
-                if usr and not database.get_peca_por_rfid(tag):
+                usr = database.get_usuario_por_rfid(tag_fmt)
+                if usr and not database.get_peca_por_rfid(tag_fmt):
                     return "Saia p/ Login"
+
+            peca_db = database.get_peca_por_rfid(tag_fmt)
+            if peca_db and peca_db.get("nome"):
+                return peca_db["nome"]
+            return "Tag Nao Cadastr."
         except Exception:
             pass
         return None
@@ -445,67 +505,74 @@ class MultilogMobileApp:
     def _validar_rfid_na_os(self, tag: str, peca_lida: Optional[Dict[str, Any]]) -> bool:
         """
         Executa a validação Poka-Yoke da etapa 1 (RFID) na O.S. ativa:
-        1. Se a tag pertence ao item ativo: libera Passo 2 (Pesagem).
-        2. Se o item ativo ainda não tinha rfid_uid cadastrado e a tag não pertence a outro item: vincula e libera Passo 2.
-        3. Se a tag pertence a outro item pendente da O.S.: seleciona esse item e já libera Passo 2.
-        4. Caso contrário: aciona o buzzer de erro (D2) e exibe alerta.
+        1. Se a tag pertence à peça correspondente ativa: valida Passo 1 e libera Passo 2 (Pesagem).
+        2. Se a peça correspondente ainda não tinha tag vinculada: vincula e valida se a tag não estiver em uso.
+        3. Caso contrário (tag não corresponde à peça esperada): toca buzzer de erro, exibe 'Tag Incorreta!' no LCD
+           e bloqueia o avanço com alerta sonoro e visual.
         """
         if not self.os_ativa:
             return False
 
-        itens = database.get_itens_ordem_servico(self.os_ativa["id"])
         peca_ativa = database.get_peca(self.item_os_selecionado["peca_id"]) if self.item_os_selecionado else None
+        peca_esperada_nome = peca_ativa["nome"] if peca_ativa else "Peça da O.S."
+        r_esp = peca_ativa.get("posicao_linha", -1) if peca_ativa else -1
+        c_esp = peca_ativa.get("posicao_coluna", -1) if peca_ativa else -1
+        pos_esp = f" (Gaveta L{r_esp+1}·C{c_esp+1})" if r_esp >= 0 and c_esp >= 0 else ""
 
-        # 1. Tag pertence ao item ativo
+        # 1. Tag pertence à peça correspondente ativa
         if self.item_os_selecionado and peca_lida and self.item_os_selecionado["peca_id"] == peca_lida["id"]:
             self.rfid_os_validado = True
             try:
                 self.hw.enviar_nome_lcd(peca_lida["nome"])
             except Exception:
                 pass
-            self.mostrar_snackbar(f"✓ Passo 1 concluído! Tag RFID de '{peca_lida['nome']}' validada. Execute a pesagem (Passo 2).")
+            self.mostrar_snackbar(f"✓ Tag RFID correspondente confirmada: '{peca_lida['nome']}'! Execute a pesagem (Passo 2).")
             self.renderizar_tela_atual()
             return True
 
-        # 2. Item ativo sem rfid_uid cadastrado ainda: vincula automaticamente e valida Passo 1
+        # 2. Se a peça correspondente ainda não possui tag vinculada no banco de dados
         if self.item_os_selecionado and peca_ativa and not (peca_ativa.get("rfid_uid") or "").strip():
-            pertence_a_outro = bool(peca_lida and any(i["peca_id"] == peca_lida["id"] for i in itens))
-            if not pertence_a_outro:
+            disponivel, msg_disp = database.verificar_disponibilidade_rfid_peca(tag, ignorar_peca_id=peca_ativa["id"])
+            if disponivel:
                 database.vincular_rfid_peca(peca_ativa["id"], tag)
                 self.rfid_os_validado = True
                 try:
                     self.hw.enviar_nome_lcd(peca_ativa["nome"])
                 except Exception:
                     pass
-                self.mostrar_snackbar(f"✓ Tag {tag} vinculada e validada para '{peca_ativa['nome']}'! Execute a pesagem (Passo 2).")
+                self.mostrar_snackbar(f"✓ Tag {tag} vinculada e confirmada para '{peca_ativa['nome']}'! Execute a pesagem (Passo 2).")
                 self.renderizar_tela_atual()
                 return True
+            else:
+                hardware_mock.tocar_buzzer_erro()
+                try:
+                    self.hw.enviar_nome_lcd("Tag Ja em Uso")
+                except Exception:
+                    pass
+                self.rfid_os_validado = False
+                self.mostrar_snackbar(f"❌ {msg_disp}", erro=True)
+                self.renderizar_tela_atual()
+                return False
 
-        if not peca_lida:
-            hardware_mock.tocar_buzzer_erro()
-            esp_str = f" (Esperado: {peca_ativa['rfid_uid']})" if (peca_ativa and peca_ativa.get("rfid_uid")) else ""
-            self.mostrar_snackbar(f"⚠️ Tag não reconhecida: {tag}{esp_str}", erro=True)
-            return False
-
-        # 3. Tag pertence a outro item pendente da O.S.
-        outro_item = next(
-            (i for i in itens if i["peca_id"] == peca_lida["id"] and i.get("quantidade_restante", i["quantidade"] - i.get("quantidade_atendida", 0)) > 0),
-            None,
-        )
-        if outro_item:
-            self.selecionar_item_os(outro_item, atualizar_tela=True, rfid_ja_validado=True)
-            self.mostrar_snackbar(
-                f"✓ Tag '{peca_lida['nome']}' validada! Gaveta L{peca_lida['posicao_linha']+1}·C{peca_lida['posicao_coluna']+1} piscando — execute a pesagem."
-            )
-            return True
-
-        # 4. Peça já concluída ou fora da O.S.
+        # 3. Tag NÃO é a da peça correspondente -> Emite aviso de erro e bloqueia pesagem
         hardware_mock.tocar_buzzer_erro()
-        item_concluido = next((i for i in itens if i["peca_id"] == peca_lida["id"]), None)
-        if item_concluido:
-            self.mostrar_snackbar(f"ℹ️ '{peca_lida['nome']}' já foi 100% atendida nesta O.S.", erro=True)
+        try:
+            self.hw.enviar_nome_lcd("Tag Incorreta!")
+        except Exception:
+            pass
+        self.rfid_os_validado = False
+
+        if peca_lida:
+            self.mostrar_snackbar(
+                f"❌ Tag RFID Incorreta! A tag lida é de '{peca_lida['nome']}', mas a peça correspondente desta etapa é '{peca_esperada_nome}'{pos_esp}!",
+                erro=True,
+            )
         else:
-            self.mostrar_snackbar(f"⚠️ Divergência: '{peca_lida['nome']}' não faz parte desta O.S.!", erro=True)
+            self.mostrar_snackbar(
+                f"❌ Tag RFID Incorreta! A tag lida ({tag}) não corresponde à peça esperada '{peca_esperada_nome}'{pos_esp}!",
+                erro=True,
+            )
+        self.renderizar_tela_atual()
         return False
 
     def tentar_selecionar_gaveta_estante(self, r: int, c: int) -> bool:
@@ -592,14 +659,25 @@ class MultilogMobileApp:
         self.campo_rfid_modal_ativo = None
         self.campo_nome_modal_ativo = None
         self.campo_peso_modal_ativo = None
+        self.id_peca_modal_ativo = None
+        self.modal_movimentacao_peca_ativa = None
+        if dlg is not None:
+            dlg.open = False
+            try:
+                dlg.update()
+            except Exception:
+                pass
         try:
             self.page.pop_dialog()
         except Exception:
             try:
                 self.page.close(dlg)
             except Exception:
-                dlg.open = False
-                self.page.update()
+                pass
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     # =========================================================================
     # Callbacks de Hardware (ESP32 Wi-Fi / Simulador)
@@ -628,15 +706,29 @@ class MultilogMobileApp:
             self._ultimo_rfid_ui_tag = tag_fmt
             self._ultimo_rfid_ui_ts = agora
 
-            # 1. Se houver modal de cadastro de peça aberto, preenche o campo de RFID e não abre outro modal
+            # 1. Se houver modal de cadastro de peça aberto, preenche o campo de RFID e valida unicidade
             if self.campo_rfid_modal_ativo is not None and self.aba_atual != "usuarios":
                 self.campo_rfid_modal_ativo.value = tag_fmt
-                self.mostrar_snackbar(f"Tag RFID capturada no cadastro: {tag_fmt}")
+                id_atual = getattr(self, "id_peca_modal_ativo", None)
+                disponivel, msg_rfid = database.verificar_disponibilidade_rfid_peca(tag_fmt, ignorar_peca_id=id_atual)
+                if not disponivel:
+                    hardware_mock.tocar_buzzer_erro()
+                    try:
+                        self.hw.enviar_nome_lcd("Tag Ja em Uso")
+                    except Exception:
+                        pass
+                    self.mostrar_snackbar(msg_rfid, erro=True)
+                else:
+                    self.mostrar_snackbar(f"✓ Tag RFID capturada: {tag_fmt}")
                 self.page.update()
                 return
 
             # 2. Se estiver na tela de Gestão de Usuários (Admin), preenche o crachá RFID do funcionário
             if self.aba_atual == "usuarios" and self.callback_rfid_tela_usuarios is not None:
+                disponivel, msg_rfid = database.verificar_disponibilidade_rfid_usuario(tag_fmt)
+                if not disponivel:
+                    hardware_mock.tocar_buzzer_erro()
+                    self.mostrar_snackbar(msg_rfid, erro=True)
                 self.callback_rfid_tela_usuarios(tag_fmt)
                 return
 
@@ -660,13 +752,9 @@ class MultilogMobileApp:
 
             # 4. Busca se a tag pertence a alguma peça do catálogo
             peca = database.get_peca_por_rfid(tag_fmt)
-            if peca and peca.get("nome"):
-                try:
-                    self.hw.enviar_nome_lcd(peca["nome"])
-                except Exception:
-                    pass
-            elif usuario_rfid and not self.os_ativa:
-                # Bloqueio de troca indevida de perfil fora da tela de Login!
+
+            # Bloqueio de troca indevida de perfil fora da tela de Login
+            if usuario_rfid and not peca and not self.os_ativa:
                 try:
                     self.hw.enviar_nome_lcd("Saia p/ Login")
                 except Exception:
@@ -678,7 +766,7 @@ class MultilogMobileApp:
                 )
                 return
 
-            # 5. Se estiver cumprindo uma Ordem de Serviço (em Minhas O.S. ou na Estante): valida Passo 1 (RFID)
+            # 5. Se estiver cumprindo uma Ordem de Serviço: valida correspondência da etapa ativa
             if self.os_ativa:
                 if usuario_rfid and not peca:
                     try:
@@ -694,20 +782,88 @@ class MultilogMobileApp:
                 self._validar_rfid_na_os(tag_fmt, peca)
                 return
 
-            if not peca:
-                hardware_mock.tocar_buzzer_erro()
-                self.mostrar_snackbar(f"Tag RFID '{tag_fmt}' não cadastrada para nenhum produto.", erro=True)
+            # 6. Se houver modal de movimentação de estoque (Entrada/Retirada) aberto:
+            if getattr(self, "modal_movimentacao_peca_ativa", None) is not None:
+                peca_mov = self.modal_movimentacao_peca_ativa
+                rfid_esperado = (peca_mov.get("rfid_uid") or "").strip()
+                if rfid_esperado:
+                    if tag_fmt == rfid_esperado:
+                        try:
+                            self.hw.enviar_nome_lcd(peca_mov["nome"])
+                        except Exception:
+                            pass
+                        self.mostrar_snackbar(f"✓ Tag RFID correspondente confirmada para '{peca_mov['nome']}'!")
+                    else:
+                        hardware_mock.tocar_buzzer_erro()
+                        try:
+                            self.hw.enviar_nome_lcd("Tag Incorreta!")
+                        except Exception:
+                            pass
+                        nome_lido = peca["nome"] if peca else "Não cadastrada"
+                        self.mostrar_snackbar(
+                            f"❌ Tag RFID Incorreta! A tag lida é de '{nome_lido}', mas a operação atual é para '{peca_mov['nome']}'!",
+                            erro=True,
+                        )
                 return
 
+            # 7. Se estiver na tela de Estante e houver uma gaveta selecionada (modo livre/admin):
+            if self.aba_atual == "estoque" and self.slot_selecionado is not None:
+                r, c = self.slot_selecionado
+                pecas_estante = database.get_pecas_por_estante(self.estante_ativa_id)
+                peca_gaveta = next((p for p in pecas_estante if p["posicao_linha"] == r and p["posicao_coluna"] == c), None)
+                if peca_gaveta:
+                    rfid_esperado = (peca_gaveta.get("rfid_uid") or "").strip()
+                    if rfid_esperado:
+                        if tag_fmt == rfid_esperado:
+                            try:
+                                self.hw.enviar_nome_lcd(peca_gaveta["nome"])
+                            except Exception:
+                                pass
+                            self.mostrar_snackbar(f"✓ Tag RFID correspondente confirmada: '{peca_gaveta['nome']}' (L{r+1}·C{c+1})!")
+                            return
+                        else:
+                            hardware_mock.tocar_buzzer_erro()
+                            try:
+                                self.hw.enviar_nome_lcd("Tag Incorreta!")
+                            except Exception:
+                                pass
+                            nome_lido = peca["nome"] if peca else "Não cadastrada"
+                            self.mostrar_snackbar(
+                                f"❌ Tag RFID Incorreta! A tag lida é de '{nome_lido}', mas a gaveta selecionada contém '{peca_gaveta['nome']}' (L{r+1}·C{c+1})!",
+                                erro=True,
+                            )
+                            return
+
+            # 8. Se a tag não pertence a nenhuma peça do catálogo:
+            if not peca:
+                hardware_mock.tocar_buzzer_erro()
+                try:
+                    self.hw.enviar_nome_lcd("Tag Nao Cadastr.")
+                except Exception:
+                    pass
+                self.mostrar_snackbar(f"❌ Tag RFID '{tag_fmt}' não vinculada a nenhuma peça do catálogo!", erro=True)
+                return
+
+            # 9. Se for Operador sem O.S. ativa:
             if self.usuario_role == "OPERARIO":
+                hardware_mock.tocar_buzzer_erro()
                 self.mostrar_snackbar("Inicie uma Ordem de Serviço em 'Minhas O.S.' antes de operar peças.", erro=True)
                 return
 
-            self.estante_ativa_id = peca.get("estante_id", 1)
-            self.slot_selecionado = (peca["posicao_linha"], peca["posicao_coluna"])
-            hardware_mock.acender_led(peca["posicao_linha"], peca["posicao_coluna"])
-            self.mostrar_snackbar(f"Peça localizada: {peca['nome']} (L{peca['posicao_linha']+1}·C{peca['posicao_coluna']+1})")
-            self.navegar("estoque")
+            # 10. Localiza e seleciona a peça na estante física
+            try:
+                self.hw.enviar_nome_lcd(peca["nome"])
+            except Exception:
+                pass
+
+            if peca.get("estante_id") and peca.get("posicao_linha", -1) >= 0 and peca.get("posicao_coluna", -1) >= 0:
+                self.estante_ativa_id = peca["estante_id"]
+                self.slot_selecionado = (peca["posicao_linha"], peca["posicao_coluna"])
+                hardware_mock.acender_led(peca["posicao_linha"], peca["posicao_coluna"])
+                self.mostrar_snackbar(f"Peça localizada: {peca['nome']} (L{peca['posicao_linha']+1}·C{peca['posicao_coluna']+1})")
+                self.navegar("estoque")
+            else:
+                self.mostrar_snackbar(f"Peça localizada no catálogo: {peca['nome']} (#{peca['id']}) [Fora de estante]")
         except Exception as ex:
             print(f"[UI] Erro ao processar RFID: {ex}")
 
@@ -822,8 +978,17 @@ class MultilogMobileApp:
         self.aba_atual = destino
         if destino != "usuarios":
             self.callback_rfid_tela_usuarios = None
+            self.callback_foto_dispositivo = None
         self._atualizar_barra_navegacao()
         self.renderizar_tela_atual()
+
+    def _on_file_picker_result(self, e):
+        try:
+            arquivos = getattr(e, "files", None)
+            if arquivos and self.callback_foto_dispositivo is not None:
+                self.callback_foto_dispositivo(arquivos[0])
+        except Exception as ex:
+            print(f"[UI] Erro no callback de FilePicker: {ex}")
 
     def renderizar_tela_atual(self):
         self._slot_ativo_container = None
@@ -1045,7 +1210,7 @@ class MultilogMobileApp:
             grid_teclado.controls.append(row_ctrl)
 
         card_login = ft.Container(
-            width=342,
+            width=336,
             bgcolor=BG_CARD,
             border=_border_all(1, "#CBD5E1"),
             border_radius=14,
@@ -1141,6 +1306,16 @@ class MultilogMobileApp:
     # =========================================================================
     # Tela 2: Estante Pick-to-Light (Vertical 20:9 Responsiva)
     # =========================================================================
+    def selecionar_estante(self, novo_estante_id: Any):
+        try:
+            eid = int(str(novo_estante_id).strip())
+        except (ValueError, TypeError):
+            return
+        self.estante_ativa_id = eid
+        self.slot_selecionado = None
+        hardware_mock.apagar_led()
+        self.renderizar_tela_atual()
+
     def _construir_tela_estoque(self) -> ft.Control:
         modo_os = self.esta_em_modo_os_estante()
 
@@ -1235,30 +1410,58 @@ class MultilogMobileApp:
                     ),
                 )
         else:
-            dd_estante = ft.Dropdown(
-                label="Estante Ativa",
-                value=str(self.estante_ativa_id),
-                expand=True,
-                dense=True,
-                text_size=12,
-                bgcolor=BG_CARD,
-                options=[_opt(str(e["id"]), f"{e['nome']} ({e['linhas']}x{e['colunas']})") for e in estantes],
-            )
-
             def ao_mudar_estante(e):
-                if dd_estante.value:
-                    self.estante_ativa_id = int(dd_estante.value)
-                    self.slot_selecionado = None
-                    hardware_mock.apagar_led()
-                    self.renderizar_tela_atual()
+                val_sel = getattr(e, "data", None) or getattr(e.control, "value", None) or dd_estante.value
+                if val_sel:
+                    self.selecionar_estante(val_sel)
 
-            dd_estante.on_change = ao_mudar_estante
-            barra_topo_estante = ft.Row(
+            kwargs_dd: Dict[str, Any] = {
+                "label": "Estante Ativa",
+                "value": str(self.estante_ativa_id),
+                "expand": True,
+                "dense": True,
+                "text_size": 12,
+                "bgcolor": BG_CARD,
+                "options": [_opt(str(e["id"]), f"{e['nome']} ({e['linhas']}x{e['colunas']})") for e in estantes],
+            }
+            if "on_select" in inspect.signature(ft.Dropdown.__init__).parameters:
+                kwargs_dd["on_select"] = ao_mudar_estante
+            else:
+                kwargs_dd["on_change"] = ao_mudar_estante
+
+            dd_estante = ft.Dropdown(**kwargs_dd)
+
+            botoes_rapidos_estantes = []
+            for est_item in estantes:
+                eid_it = int(est_item["id"])
+                ativo_est = (eid_it == int(self.estante_ativa_id))
+                botoes_rapidos_estantes.append(
+                    _btn(
+                        f"{est_item['nome']} ({est_item['linhas']}×{est_item['colunas']})",
+                        on_click=lambda ev, x_id=eid_it: self.selecionar_estante(x_id),
+                        bgcolor=MULTILOG_NAVY if ativo_est else "#E2E8F0",
+                        color="#FFFFFF" if ativo_est else TEXT_MAIN,
+                        height=30,
+                        font_size=10,
+                    )
+                )
+
+            barra_topo_estante = ft.Column(
                 spacing=4,
                 controls=[
-                    dd_estante,
-                    _btn("+ Nova", on_click=lambda e: self.abrir_modal_estante(editar=False), bgcolor=MULTILOG_NAVY, height=36),
-                    _btn("⚙️", on_click=lambda e: self.abrir_modal_estante(editar=True), bgcolor="#475569", height=36),
+                    ft.Row(
+                        spacing=4,
+                        controls=[
+                            dd_estante,
+                            _btn("+ Nova", on_click=lambda e: self.abrir_modal_estante(editar=False), bgcolor=MULTILOG_NAVY, height=36, font_size=11),
+                            _btn("⚙️", on_click=lambda e: self.abrir_modal_estante(editar=True), bgcolor="#475569", width=40, height=36, font_size=12),
+                        ],
+                    ),
+                    ft.Row(
+                        spacing=4,
+                        scroll=ft.ScrollMode.AUTO,
+                        controls=botoes_rapidos_estantes,
+                    ),
                 ],
             )
 
@@ -1388,33 +1591,37 @@ class MultilogMobileApp:
             else "Toque na gaveta para acender o LED"
         )
 
+        controls_tela = [
+            barra_topo_estante,
+            ft.Container(
+                bgcolor=BG_CARD,
+                border=_border_all(1, BORDER_SUBTLE),
+                border_radius=12,
+                padding=8,
+                content=ft.Column(
+                    spacing=6,
+                    controls=[
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(f"{estante_atual['nome']} ({linhas}×{colunas})", size=12, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+                                ft.Text(legenda_texto, size=9, color=TEXT_MUTED),
+                            ],
+                        ),
+                        matriz_col,
+                    ],
+                ),
+            ),
+            painel_inferior,
+        ]
+        if not modo_os:
+            controls_tela.append(self._construir_secao_catalogo_pecas())
+
         return ft.Column(
             expand=True,
             scroll=ft.ScrollMode.AUTO,
             spacing=8,
-            controls=[
-                barra_topo_estante,
-                ft.Container(
-                    bgcolor=BG_CARD,
-                    border=_border_all(1, BORDER_SUBTLE),
-                    border_radius=12,
-                    padding=8,
-                    content=ft.Column(
-                        spacing=6,
-                        controls=[
-                            ft.Row(
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                controls=[
-                                    ft.Text(f"{estante_atual['nome']} ({linhas}×{colunas})", size=12, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
-                                    ft.Text(legenda_texto, size=9, color=TEXT_MUTED),
-                                ],
-                            ),
-                            matriz_col,
-                        ],
-                    ),
-                ),
-                painel_inferior,
-            ],
+            controls=controls_tela,
         )
 
     def _construir_painel_terminal_os_ativo(self) -> ft.Control:
@@ -1685,7 +1892,8 @@ class MultilogMobileApp:
                     spacing=6,
                     controls=[
                         ft.Text(f"Gaveta L{r+1}·C{c+1} Vazia (LED Aceso)", size=13, weight=ft.FontWeight.BOLD, color=MULTILOG_NAVY),
-                        _btn("➕ Cadastrar Peça aqui", on_click=lambda e: self.abrir_modal_cadastro_peca(r, c), bgcolor=MULTILOG_NAVY, height=36),
+                        ft.Text("Coloque uma peça do catálogo nesta gaveta ou cadastre uma nova.", size=11, color=TEXT_MUTED),
+                        _btn("➕ Adicionar Peça a esta Gaveta", on_click=lambda e: self.abrir_modal_adicionar_peca_gaveta(r, c), bgcolor=MULTILOG_NAVY, height=36),
                     ],
                 ),
             )
@@ -1729,12 +1937,565 @@ class MultilogMobileApp:
                         spacing=6,
                         controls=[
                             _btn("✏️ Editar", on_click=lambda e: self.abrir_modal_cadastro_peca(r, c, peca_existente=peca), bgcolor="#475569", expand=True, height=32),
-                            _btn("🗑️ Excluir", on_click=lambda e: self.confirmar_exclusao_peca(peca), bgcolor=ACCENT_ROSE, expand=True, height=32),
+                            _btn("📤 Desocupar Gaveta", on_click=lambda e: self.confirmar_desocupar_gaveta(peca), bgcolor="#EA580C", expand=True, height=32),
                         ],
                     ),
                 ],
             ),
         )
+
+    def confirmar_desocupar_gaveta(self, peca: Dict[str, Any]):
+        r = peca.get("posicao_linha", -1)
+        c = peca.get("posicao_coluna", -1)
+        pos_str = f"L{r+1}·C{c+1}" if (r is not None and r >= 0 and c is not None and c >= 0) else ""
+
+        def confirmar(e):
+            self.fechar_dialogo(dlg)
+            ok, msg = database.desalocar_peca_da_estante(peca["id"])
+            if ok:
+                hardware_mock.apagar_led()
+                self.renderizar_tela_atual()
+            self.mostrar_snackbar(msg, erro=not ok)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("📤 Desocupar Gaveta", size=15, weight=ft.FontWeight.BOLD, color="#C2410C"),
+            content=ft.Container(
+                width=300,
+                content=ft.Column(
+                    tight=True,
+                    spacing=6,
+                    controls=[
+                        ft.Text(f"Deseja desocupar a gaveta {pos_str}?", size=12, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+                        ft.Text(
+                            f"A peça '{peca['nome']}' (#{peca['id']}) será removida desta gaveta física, mas continuará salva no catálogo de peças cadastradas.",
+                            size=11,
+                            color=TEXT_MUTED,
+                        ),
+                    ],
+                ),
+            ),
+            actions=[
+                ft.TextButton("Cancelar", on_click=lambda e: self.fechar_dialogo(dlg)),
+                _btn("Desocupar", on_click=confirmar, bgcolor="#EA580C", height=34),
+            ],
+        )
+        self.abrir_dialogo(dlg)
+
+    def abrir_modal_adicionar_peca_gaveta(self, r: int, c: int):
+        todas = database.get_todas_pecas()
+
+        opcoes = []
+        peca_selecionada_id = None
+        for p in todas:
+            esta_alocada = (
+                p.get("posicao_linha") is not None
+                and p["posicao_linha"] >= 0
+                and p.get("posicao_coluna") is not None
+                and p["posicao_coluna"] >= 0
+                and p.get("estante_id")
+            )
+            if esta_alocada:
+                txt = f"{p['nome']} (#{p['id']}) · Em {p.get('estante_nome') or 'Estante'} L{p['posicao_linha']+1}C{p['posicao_coluna']+1}"
+            else:
+                txt = f"★ {p['nome']} (#{p['id']}) [Disponível]"
+                if peca_selecionada_id is None:
+                    peca_selecionada_id = str(p["id"])
+            opcoes.append(_opt(str(p["id"]), txt))
+
+        if not peca_selecionada_id and todas:
+            peca_selecionada_id = str(todas[0]["id"])
+
+        tf_qtd_inicial = ft.TextField(
+            label="Quantidade Inicial na Gaveta *",
+            value="10",
+            dense=True,
+            text_size=12,
+            bgcolor=BG_ELEVATED,
+        )
+
+        def vincular(e):
+            if not dd_peca.value:
+                self.mostrar_snackbar("Selecione uma peça do catálogo.", erro=True)
+                return
+            try:
+                qtd_i = int((tf_qtd_inicial.value or "0").strip())
+                if qtd_i < 0:
+                    raise ValueError()
+            except ValueError:
+                self.mostrar_snackbar("Informe uma quantidade válida (≥ 0).", erro=True)
+                return
+
+            p_id = int(dd_peca.value)
+            peca_obj = database.get_peca(p_id)
+            database.alocar_peca_na_estante(p_id, self.estante_ativa_id, r, c, qtd_i)
+            if qtd_i > 0:
+                database.registrar_operacao(self.funcionario_id, p_id, "ADICAO", qtd_i)
+
+            self.fechar_dialogo(dlg)
+            self.mostrar_snackbar(f"Peça '{peca_obj['nome'] if peca_obj else p_id}' alocada em L{r+1}·C{c+1} ({qtd_i} un)!")
+            self.renderizar_tela_atual()
+
+        def ir_para_novo_cadastro(e):
+            self.fechar_dialogo(dlg)
+            self.abrir_modal_cadastro_peca(r, c)
+
+        if todas:
+            def ao_selecionar_peca(e):
+                val = getattr(e, "data", None) or getattr(e.control, "value", None) or dd_peca.value
+                if val:
+                    dd_peca.value = str(val)
+
+            kwargs_dd: Dict[str, Any] = {
+                "label": "Escolher Peça do Catálogo *",
+                "value": peca_selecionada_id,
+                "dense": True,
+                "text_size": 12,
+                "bgcolor": BG_ELEVATED,
+                "options": opcoes,
+            }
+            if "on_select" in inspect.signature(ft.Dropdown.__init__).parameters:
+                kwargs_dd["on_select"] = ao_selecionar_peca
+            else:
+                kwargs_dd["on_change"] = ao_selecionar_peca
+            dd_peca = ft.Dropdown(**kwargs_dd)
+
+            corpo = ft.Column(
+                tight=True,
+                spacing=8,
+                controls=[
+                    ft.Text(f"Colocar peça cadastrada na gaveta L{r+1}·C{c+1}:", size=11, color=TEXT_MUTED),
+                    dd_peca,
+                    tf_qtd_inicial,
+                    ft.Divider(height=1, color=BORDER_SUBTLE),
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.TextButton("+ Ou cadastrar nova peça do zero", on_click=ir_para_novo_cadastro),
+                        ],
+                    ),
+                ],
+            )
+            acoes = [
+                ft.TextButton("Cancelar", on_click=lambda e: self.fechar_dialogo(dlg)),
+                _btn("Colocar na Gaveta", on_click=vincular, bgcolor=MULTILOG_NAVY, height=34),
+            ]
+        else:
+            corpo = ft.Column(
+                tight=True,
+                spacing=8,
+                controls=[
+                    ft.Text("Nenhuma peça cadastrada no catálogo ainda.", size=12, color=TEXT_MAIN),
+                    ft.Text("Cadastre uma nova peça para colocar nesta gaveta:", size=11, color=TEXT_MUTED),
+                ],
+            )
+            acoes = [
+                ft.TextButton("Cancelar", on_click=lambda e: self.fechar_dialogo(dlg)),
+                _btn("+ Cadastrar Nova Peça", on_click=ir_para_novo_cadastro, bgcolor=MULTILOG_NAVY, height=34),
+            ]
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Adicionar Peça · L{r+1}·C{c+1}", size=15, weight=ft.FontWeight.BOLD),
+            content=ft.Container(width=300, content=corpo),
+            actions=acoes,
+        )
+        self.abrir_dialogo(dlg)
+
+    def _construir_secao_catalogo_pecas(self) -> ft.Control:
+        todas = database.get_todas_pecas()
+
+        filtro = getattr(self, "filtro_busca_catalogo", "").strip().lower()
+        if filtro:
+            pecas_filtradas = [
+                p for p in todas
+                if filtro in (p.get("nome") or "").lower()
+                or filtro in (p.get("tipo") or "").lower()
+                or filtro in (p.get("rfid_uid") or "").lower()
+                or filtro in str(p.get("id", ""))
+            ]
+        else:
+            pecas_filtradas = todas
+
+        cards_pecas = []
+        for p in pecas_filtradas:
+            r = p.get("posicao_linha")
+            c = p.get("posicao_coluna")
+            esta_alocada = (
+                r is not None
+                and r >= 0
+                and c is not None
+                and c >= 0
+                and p.get("estante_id")
+            )
+
+            if esta_alocada:
+                est_nome = p.get("estante_nome") or "Estante"
+                status_badge = ft.Container(
+                    bgcolor="#ECFDF5",
+                    border=_border_all(1, "#A7F3D0"),
+                    border_radius=6,
+                    padding=_pad_sym(6, 2),
+                    content=ft.Text(
+                        f"📍 {est_nome} L{r+1}·C{c+1} ({p.get('quantidade_estoque', 0)} un)",
+                        size=10,
+                        weight=ft.FontWeight.BOLD,
+                        color="#065F46",
+                        no_wrap=True,
+                    ),
+                )
+            else:
+                status_badge = ft.Container(
+                    bgcolor="#F1F5F9",
+                    border=_border_all(1, "#E2E8F0"),
+                    border_radius=6,
+                    padding=_pad_sym(6, 2),
+                    content=ft.Text(
+                        "○ Fora de estante",
+                        size=10,
+                        weight=ft.FontWeight.BOLD,
+                        color=TEXT_MUTED,
+                        no_wrap=True,
+                    ),
+                )
+
+            rfid_str = p.get("rfid_uid") or ""
+            rfid_badge = ft.Container(
+                bgcolor="#EFF6FF" if rfid_str else "#F8FAFC",
+                border=_border_all(1, "#BFDBFE" if rfid_str else "#E2E8F0"),
+                border_radius=4,
+                padding=_pad_sym(4, 1),
+                content=ft.Text(
+                    f"🏷️ {rfid_str}" if rfid_str else "S/ Tag",
+                    size=9,
+                    color=MULTILOG_BLUE if rfid_str else TEXT_MUTED,
+                ),
+            )
+
+            card = ft.Container(
+                bgcolor=BG_ELEVATED,
+                border=_border_all(1, BORDER_SUBTLE),
+                border_radius=8,
+                padding=8,
+                content=ft.Column(
+                    spacing=4,
+                    controls=[
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(
+                                    f"{p['nome']} (#{p['id']})",
+                                    size=12,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=TEXT_MAIN,
+                                    expand=True,
+                                    no_wrap=True,
+                                ),
+                                rfid_badge,
+                            ],
+                        ),
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(
+                                    f"{p['tipo']} · {p['peso_unitario_g']}g · {p.get('dimensoes', 'Padrão')}",
+                                    size=10,
+                                    color=TEXT_MUTED,
+                                ),
+                                status_badge,
+                            ],
+                        ),
+                        ft.Row(
+                            spacing=6,
+                            controls=[
+                                _btn(
+                                    "✏️ Editar",
+                                    on_click=lambda e, pc=p: self.abrir_modal_cadastro_peca_catalogo(peca_existente=pc),
+                                    bgcolor="#475569",
+                                    expand=True,
+                                    height=28,
+                                    font_size=10,
+                                ),
+                                _btn(
+                                    "🗑️ Remover",
+                                    on_click=lambda e, pc=p: self.confirmar_exclusao_peca_catalogo(pc),
+                                    bgcolor=ACCENT_ROSE,
+                                    expand=True,
+                                    height=28,
+                                    font_size=10,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            )
+            cards_pecas.append(card)
+
+        if not cards_pecas:
+            cards_pecas.append(
+                ft.Container(
+                    bgcolor=BG_ELEVATED,
+                    border_radius=8,
+                    padding=12,
+                    alignment=_align_center(),
+                    content=ft.Text("Nenhuma peça cadastrada encontrada.", size=11, color=TEXT_MUTED),
+                )
+            )
+
+        def ao_digitar_busca(e):
+            self.filtro_busca_catalogo = (e.control.value or "").strip()
+            self.renderizar_tela_atual()
+
+        tf_busca = ft.TextField(
+            hint_text="Filtrar peças por nome, tipo ou RFID...",
+            value=getattr(self, "filtro_busca_catalogo", ""),
+            dense=True,
+            text_size=11,
+            bgcolor=BG_ELEVATED,
+            expand=True,
+            on_change=ao_digitar_busca,
+        )
+
+        return ft.Container(
+            bgcolor=BG_CARD,
+            border=_border_all(1, BORDER_SUBTLE),
+            border_radius=12,
+            padding=10,
+            content=ft.Column(
+                spacing=8,
+                controls=[
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        controls=[
+                            ft.Row(
+                                spacing=4,
+                                controls=[
+                                    ft.Text("📋 Peças Cadastradas", size=13, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+                                    ft.Container(
+                                        bgcolor=MULTILOG_NAVY,
+                                        border_radius=6,
+                                        padding=_pad_sym(5, 1),
+                                        content=ft.Text(f"{len(todas)}", size=10, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                                    ),
+                                ],
+                            ),
+                            _btn(
+                                "+ Nova Peça",
+                                on_click=lambda e: self.abrir_modal_cadastro_peca_catalogo(),
+                                bgcolor=MULTILOG_NAVY,
+                                height=30,
+                                font_size=11,
+                            ),
+                        ],
+                    ),
+                    ft.Text(
+                        "Catálogo geral de peças do sistema (adicionar / remover novas peças da lista).",
+                        size=10,
+                        color=TEXT_MUTED,
+                    ),
+                    tf_busca,
+                    ft.Column(
+                        spacing=6,
+                        controls=cards_pecas,
+                    ),
+                ],
+            ),
+        )
+
+    def abrir_modal_cadastro_peca_catalogo(self, peca_existente: Optional[Dict[str, Any]] = None):
+        editando = peca_existente is not None
+        id_peca = peca_existente["id"] if editando and peca_existente else None
+        self.id_peca_modal_ativo = id_peca
+
+        tf_nome = ft.TextField(
+            label="Nome da Peça *",
+            value=peca_existente["nome"] if editando else "",
+            dense=True,
+            text_size=12,
+            bgcolor=BG_ELEVATED,
+        )
+        dd_tipo = ft.Dropdown(
+            label="Categoria",
+            value=peca_existente["tipo"] if editando else "Fixador",
+            dense=True,
+            text_size=12,
+            bgcolor=BG_ELEVATED,
+            options=[
+                _opt("Fixador", "Fixador"),
+                _opt("Parafuso", "Parafuso"),
+                _opt("Porca", "Porca"),
+                _opt("Arruela", "Arruela"),
+                _opt("Elétrica", "Elétrica"),
+                _opt("Mecânica", "Mecânica"),
+                _opt("Pneumática", "Pneumática"),
+                _opt("Hidráulica", "Hidráulica"),
+                _opt("Outro", "Outro"),
+            ],
+        )
+        tf_dim = ft.TextField(
+            label="Dimensões",
+            value=peca_existente.get("dimensoes", "Padrão") if editando else "Padrão",
+            dense=True,
+            text_size=12,
+            bgcolor=BG_ELEVATED,
+        )
+        peso_sugerido = peca_existente["peso_unitario_g"] if editando else (self.hw.ler_ultimo_peso() if self.hw.ler_ultimo_peso() > 0 else 10.0)
+        tf_peso_unit = ft.TextField(
+            label="Peso Unit. (g) *",
+            value=str(peso_sugerido),
+            dense=True,
+            text_size=12,
+            bgcolor=BG_ELEVATED,
+            expand=True,
+        )
+        tf_rfid = ft.TextField(
+            label="Tag RFID",
+            value=peca_existente.get("rfid_uid", "") if editando else (self.hw.ultima_tag or ""),
+            dense=True,
+            text_size=12,
+            bgcolor=BG_ELEVATED,
+        )
+        tf_desc = ft.TextField(
+            label="Descrição (opcional)",
+            value=peca_existente.get("descricao", "") if editando else "",
+            dense=True,
+            text_size=12,
+            bgcolor=BG_ELEVATED,
+        )
+
+        self.campo_rfid_modal_ativo = tf_rfid
+        self.campo_nome_modal_ativo = tf_nome
+        self.campo_peso_modal_ativo = tf_peso_unit
+
+        def salvar(e):
+            nome = (tf_nome.value or "").strip()
+            if not nome:
+                self.mostrar_snackbar("Informe o nome da peça.", erro=True)
+                return
+            try:
+                peso_u = float((tf_peso_unit.value or "0").replace(",", ".").strip())
+                if peso_u <= 0:
+                    raise ValueError()
+            except ValueError:
+                self.mostrar_snackbar("Informe um peso unitário válido (> 0).", erro=True)
+                return
+
+            rfid_fmt = database.formatar_rfid_uid(tf_rfid.value or "")
+            if rfid_fmt:
+                disponivel, msg_rfid = database.verificar_disponibilidade_rfid_peca(
+                    rfid_fmt, ignorar_peca_id=id_peca
+                )
+                if not disponivel:
+                    hardware_mock.tocar_buzzer_erro()
+                    self.mostrar_snackbar(msg_rfid, erro=True)
+                    return
+
+            dim_val = (tf_dim.value or "Padrão").strip()
+            desc_val = (tf_desc.value or "").strip()
+            tipo_val = dd_tipo.value or "Fixador"
+
+            if editando and peca_existente:
+                dados = dict(peca_existente)
+                dados["nome"] = nome
+                dados["tipo"] = tipo_val
+                dados["peso_unitario_g"] = peso_u
+                dados["dimensoes"] = dim_val
+                dados["rfid_uid"] = rfid_fmt
+                dados["descricao"] = desc_val
+                database.upsert_peca(dados)
+                self.mostrar_snackbar(f"Peça '{nome}' atualizada no catálogo!")
+            else:
+                database.cadastrar_peca_catalogo(
+                    nome=nome,
+                    tipo=tipo_val,
+                    peso_unitario_g=peso_u,
+                    dimensoes=dim_val,
+                    rfid_uid=rfid_fmt,
+                    descricao=desc_val,
+                )
+                self.mostrar_snackbar(f"Peça '{nome}' cadastrada na lista!")
+
+            self.fechar_dialogo(dlg)
+            self.renderizar_tela_atual()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"{'Editar Peça' if editando else 'Nova Peça no Catálogo'}", size=15, weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=300,
+                content=ft.Column(
+                    tight=True,
+                    scroll=ft.ScrollMode.AUTO,
+                    spacing=6,
+                    controls=[
+                        tf_nome,
+                        dd_tipo,
+                        tf_dim,
+                        ft.Row(
+                            spacing=6,
+                            controls=[
+                                tf_peso_unit,
+                                _btn(
+                                    "⚖️ Ler",
+                                    on_click=lambda e: (
+                                        setattr(tf_peso_unit, "value", f"{self.hw.ler_ultimo_peso():.1f}"),
+                                        self.page.update(),
+                                    ),
+                                    bgcolor=MULTILOG_CYAN,
+                                    height=34,
+                                ),
+                            ],
+                        ),
+                        tf_rfid,
+                        tf_desc,
+                    ],
+                ),
+            ),
+            actions=[
+                ft.TextButton("Cancelar", on_click=lambda e: self.fechar_dialogo(dlg)),
+                _btn("Salvar no Catálogo", on_click=salvar, bgcolor=MULTILOG_NAVY, height=34),
+            ],
+        )
+        self.abrir_dialogo(dlg)
+
+    def confirmar_exclusao_peca_catalogo(self, peca: Dict[str, Any]):
+        def confirmar(e):
+            self.fechar_dialogo(dlg)
+            ok, msg = database.excluir_peca(peca["id"])
+            if ok:
+                hardware_mock.apagar_led()
+                self.renderizar_tela_atual()
+            self.mostrar_snackbar(msg, erro=not ok)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("⚠️ Remover Peça da Lista", size=15, weight=ft.FontWeight.BOLD, color="#991B1B"),
+            content=ft.Container(
+                width=300,
+                content=ft.Column(
+                    tight=True,
+                    spacing=6,
+                    controls=[
+                        ft.Text(
+                            f"Deseja remover a peça '{peca['nome']}' (#{peca['id']}) do catálogo?",
+                            size=12,
+                            weight=ft.FontWeight.BOLD,
+                            color=TEXT_MAIN,
+                        ),
+                        ft.Text(
+                            "A peça será excluída permanentemente da lista do sistema.",
+                            size=11,
+                            color=TEXT_MUTED,
+                        ),
+                    ],
+                ),
+            ),
+            actions=[
+                ft.TextButton("Cancelar", on_click=lambda e: self.fechar_dialogo(dlg)),
+                _btn("Remover da Lista", on_click=confirmar, bgcolor=ACCENT_ROSE, height=34),
+            ],
+        )
+        self.abrir_dialogo(dlg)
 
     def confirmar_exclusao_peca(self, peca: Dict[str, Any]):
         ok, msg = database.excluir_peca(peca["id"])
@@ -1742,8 +2503,11 @@ class MultilogMobileApp:
         if ok:
             hardware_mock.apagar_led()
             self.renderizar_tela_atual()
+            hardware_mock.apagar_led()
+            self.renderizar_tela_atual()
 
     def abrir_modal_movimentacao_estoque(self, peca: Dict[str, Any], tipo_op: str):
+        self.modal_movimentacao_peca_ativa = peca
         titulo_op = "Entrada (+)" if tipo_op == "ADICAO" else "Retirada (-)"
         tf_qtd = ft.TextField(label="Quantidade (un)", value="1", dense=True, text_size=12, bgcolor=BG_ELEVATED)
         peso_unit = float(peca["peso_unitario_g"])
@@ -1785,10 +2549,11 @@ class MultilogMobileApp:
             sucesso, msg, _ = logic.processar_operacao(self.funcionario_id, dados_op, tipo_op, peso_informado=peso_lido)
             if not sucesso:
                 hardware_mock.tocar_buzzer_erro()
-            self.mostrar_snackbar(msg, erro=not sucesso)
-            if sucesso:
+                self.mostrar_snackbar(msg, erro=True)
+            else:
                 self.fechar_dialogo(dlg)
                 self.renderizar_tela_atual()
+                self.mostrar_snackbar(msg, erro=False)
 
         dlg = ft.AlertDialog(
             modal=True,
@@ -1868,6 +2633,7 @@ class MultilogMobileApp:
         self.campo_rfid_modal_ativo = tf_rfid
         self.campo_nome_modal_ativo = tf_nome
         self.campo_peso_modal_ativo = tf_peso_unit
+        self.id_peca_modal_ativo = id_peca
 
         def salvar_peca(e):
             nome = (tf_nome.value or "").strip()
@@ -1883,6 +2649,16 @@ class MultilogMobileApp:
                 self.mostrar_snackbar("Informe peso (> 0) e quantidade válidos.", erro=True)
                 return
 
+            rfid_fmt = database.formatar_rfid_uid(tf_rfid.value or "")
+            if rfid_fmt:
+                disponivel, msg_rfid = database.verificar_disponibilidade_rfid_peca(
+                    rfid_fmt, ignorar_peca_id=id_peca if editando else None
+                )
+                if not disponivel:
+                    hardware_mock.tocar_buzzer_erro()
+                    self.mostrar_snackbar(msg_rfid, erro=True)
+                    return
+
             dados = {
                 "id": id_peca,
                 "nome": nome,
@@ -1892,7 +2668,7 @@ class MultilogMobileApp:
                 "peso_unitario_g": peso_u,
                 "dimensoes": (tf_dim.value or "Padrão").strip(),
                 "estante_id": self.estante_ativa_id,
-                "rfid_uid": database.formatar_rfid_uid(tf_rfid.value or ""),
+                "rfid_uid": rfid_fmt,
                 "descricao": "",
             }
             database.upsert_peca(dados)
@@ -1968,21 +2744,47 @@ class MultilogMobileApp:
             except Exception as ex:
                 self.mostrar_snackbar(f"Erro: {ex}", erro=True)
 
-        def excluir(e):
+        def confirmar_exclusao_estante(ev):
+            self.fechar_dialogo(dlg_confirma)
             if not estante_atual:
                 return
             ok, msg = database.excluir_estante(estante_atual["id"])
-            self.mostrar_snackbar(msg, erro=not ok)
             if ok:
                 estantes_rest = database.get_todas_estantes()
                 self.estante_ativa_id = estantes_rest[0]["id"] if estantes_rest else 1
-                self.fechar_dialogo(dlg)
+                self.slot_selecionado = None
                 self.renderizar_tela_atual()
+            self.mostrar_snackbar(msg, erro=not ok)
+
+        dlg_confirma = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("⚠️ Excluir Estante", size=15, weight=ft.FontWeight.BOLD, color="#991B1B"),
+            content=ft.Container(
+                width=290,
+                content=ft.Text(
+                    f"Deseja realmente excluir a '{estante_atual['nome']}' ({estante_atual['linhas']}×{estante_atual['colunas']})?"
+                    if estante_atual
+                    else "Deseja realmente excluir esta estante?",
+                    size=12,
+                    color=TEXT_MAIN,
+                ),
+            ),
+            actions=[
+                ft.TextButton("Cancelar", on_click=lambda ev: self.fechar_dialogo(dlg_confirma)),
+                _btn("🗑️ Confirmar", on_click=confirmar_exclusao_estante, bgcolor=ACCENT_ROSE, height=34, font_size=12),
+            ],
+        )
+
+        def pedir_confirmacao_exclusao(e):
+            if not estante_atual:
+                return
+            self.fechar_dialogo(dlg)
+            self.abrir_dialogo(dlg_confirma)
 
         acoes = [ft.TextButton("Cancelar", on_click=lambda e: self.fechar_dialogo(dlg))]
         if editar:
-            acoes.append(ft.TextButton("Excluir", on_click=excluir))
-        acoes.append(_btn("Salvar", on_click=salvar, bgcolor=MULTILOG_NAVY, height=34))
+            acoes.append(_btn("🗑️ Excluir", on_click=pedir_confirmacao_exclusao, bgcolor="#FEE2E2", color="#991B1B", height=34, font_size=11))
+        acoes.append(_btn("Salvar", on_click=salvar, bgcolor=MULTILOG_NAVY, height=34, font_size=12))
 
         dlg = ft.AlertDialog(
             modal=True,
@@ -2006,9 +2808,54 @@ class MultilogMobileApp:
     # =========================================================================
     # Tela 3: Lista de Ordens de Serviço e Execução Guiada (Vertical 20:9)
     # =========================================================================
+    def definir_ordenacao_os(self, criterio: str):
+        self.ordenacao_os = (criterio or "RECENTE").strip().upper()
+        self.renderizar_tela_atual()
+
     def _construir_tela_ordens(self) -> ft.Control:
         filtro_op = None if self.usuario_role == "ADMIN" else self.funcionario_id
-        ordens = database.get_ordens_servico_abertas(filtro_op)
+        ordens_brutas = database.get_ordens_servico_abertas(filtro_op)
+        ordens = logic.ordenar_ordens_servico(ordens_brutas, self.ordenacao_os)
+
+        opcoes_ord = [
+            ("RECENTE", "🕒 Recente"),
+            ("ANTIGA", "⏳ Antiga"),
+            ("AZ", "🔤 A-Z"),
+            ("ZA", "🔤 Z-A"),
+        ]
+        botoes_ordenacao = []
+        for chave_ord, rotulo_ord in opcoes_ord:
+            ativo_ord = (self.ordenacao_os == chave_ord)
+            botoes_ordenacao.append(
+                _btn(
+                    rotulo_ord,
+                    on_click=lambda e, c=chave_ord: self.definir_ordenacao_os(c),
+                    bgcolor=MULTILOG_NAVY if ativo_ord else "#E2E8F0",
+                    color="#FFFFFF" if ativo_ord else TEXT_MAIN,
+                    expand=True,
+                    height=34,
+                    font_size=11,
+                )
+            )
+
+        barra_agrupamento = ft.Container(
+            bgcolor=BG_CARD,
+            border=_border_all(1, BORDER_SUBTLE),
+            border_radius=10,
+            padding=_pad_sym(8, 6),
+            content=ft.Column(
+                spacing=4,
+                controls=[
+                    ft.Text(
+                        "Agrupar / Ordenar Ordens de Serviço:",
+                        size=10,
+                        weight=ft.FontWeight.BOLD,
+                        color=TEXT_MUTED,
+                    ),
+                    ft.Row(spacing=4, controls=botoes_ordenacao),
+                ],
+            ),
+        )
 
         lista = ft.Column(spacing=8)
         if not ordens:
@@ -2029,6 +2876,7 @@ class MultilogMobileApp:
                 tot_atend = sum(i.get("quantidade_atendida", 0) for i in itens)
                 estante = database.get_estante(o.get("estante_id", 1))
                 nome_estante = estante["nome"] if estante else "Estante Padrão"
+                criada_em = (o.get("data_criacao") or "-")[:16]
 
                 lista.controls.append(
                     ft.Container(
@@ -2052,7 +2900,7 @@ class MultilogMobileApp:
                                         ),
                                     ],
                                 ),
-                                ft.Text(f"📍 {nome_estante} | ⏰ {o.get('prazo_limite') or '-'}", size=11, color=TEXT_MUTED),
+                                ft.Text(f"📍 {nome_estante} | 📅 {criada_em} | ⏰ {o.get('prazo_limite') or '-'}", size=10, color=TEXT_MUTED),
                                 _btn("▶️ Iniciar / Continuar O.S.", on_click=lambda e, x=o: self.iniciar_execucao_os(x), bgcolor=MULTILOG_NAVY, height=38, font_size=12),
                             ],
                         ),
@@ -2068,9 +2916,10 @@ class MultilogMobileApp:
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     controls=[
                         ft.Text("Ordens de Serviço", size=16, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
-                        _btn("🔄 Atualizar", on_click=lambda e: self.renderizar_tela_atual(), bgcolor=MULTILOG_CYAN, height=32),
+                        _btn("🔄 Atualizar", on_click=lambda e: self.renderizar_tela_atual(), bgcolor=MULTILOG_CYAN, height=32, font_size=11),
                     ],
                 ),
+                barra_agrupamento,
                 lista,
             ],
         )
@@ -2506,6 +3355,61 @@ class MultilogMobileApp:
 
         self.callback_rfid_tela_usuarios = lambda t: receber_tag_usuario(t, "Leitor RFID")
 
+        def processar_arquivo_dispositivo(arq: Any, dlg_para_fechar: Optional[ft.AlertDialog] = None):
+            if not arq:
+                return
+            raw_bytes = getattr(arq, "bytes", None)
+            if isinstance(raw_bytes, list):
+                raw_bytes = bytes(raw_bytes)
+            elif raw_bytes is not None:
+                raw_bytes = bytes(raw_bytes)
+
+            caminho_arq = (getattr(arq, "path", None) or "").strip()
+            nome_arq = (getattr(arq, "name", None) or "").strip() or (
+                os.path.basename(caminho_arq) if caminho_arq else "foto_celular.jpg"
+            )
+
+            if not raw_bytes and caminho_arq and os.path.isfile(caminho_arq):
+                try:
+                    with open(caminho_arq, "rb") as f:
+                        raw_bytes = f.read()
+                except Exception:
+                    raw_bytes = None
+
+            if not raw_bytes and not (caminho_arq and os.path.isfile(caminho_arq)):
+                self.mostrar_snackbar("Não foi possível ler os dados da imagem selecionada.", erro=True)
+                return
+
+            atualizar_preview(caminho=caminho_arq, blob=raw_bytes, nome_arq=nome_arq)
+            if dlg_para_fechar is not None:
+                self.fechar_dialogo(dlg_para_fechar)
+            self.mostrar_snackbar(f"📷 Foto '{nome_arq}' selecionada do dispositivo!")
+
+        self.callback_foto_dispositivo = processar_arquivo_dispositivo
+
+        async def selecionar_foto_do_celular(e=None, dlg_para_fechar: Optional[ft.AlertDialog] = None):
+            if self.file_picker is None:
+                self.mostrar_snackbar("Seletor de arquivos indisponível neste dispositivo.", erro=True)
+                return
+            try:
+                tipo_img = getattr(getattr(ft, "FilePickerFileType", None), "IMAGE", None)
+                kwargs_pick: Dict[str, Any] = {
+                    "dialog_title": "Selecionar Foto de Perfil",
+                    "allow_multiple": False,
+                    "with_data": True,
+                }
+                if tipo_img is not None:
+                    kwargs_pick["file_type"] = tipo_img
+                res = self.file_picker.pick_files(**kwargs_pick)
+                if inspect.isawaitable(res):
+                    arquivos = await res
+                else:
+                    arquivos = res
+                if arquivos:
+                    processar_arquivo_dispositivo(arquivos[0], dlg_para_fechar=dlg_para_fechar)
+            except Exception as ex:
+                self.mostrar_snackbar(f"Erro ao abrir arquivos do celular: {ex}", erro=True)
+
         def abrir_seletor_fotos_salvas(e):
             pasta = _pasta_fotos_funcionarios()
             arquivos = []
@@ -2546,6 +3450,9 @@ class MultilogMobileApp:
                 else:
                     self.mostrar_snackbar("Arquivo de imagem não encontrado neste caminho.", erro=True)
 
+            async def escolher_do_celular_no_modal(ev):
+                await selecionar_foto_do_celular(ev, dlg_para_fechar=dlg_foto)
+
             dlg_foto = ft.AlertDialog(
                 modal=True,
                 title=ft.Text("📷 Selecionar Foto do Funcionário", size=14, weight=ft.FontWeight.BOLD),
@@ -2554,8 +3461,17 @@ class MultilogMobileApp:
                     content=ft.Column(
                         tight=True,
                         spacing=6,
+                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                         controls=[
-                            ft.Text("Fotos disponíveis em fotos_funcionarios/:", size=11, color=TEXT_MUTED),
+                            _btn(
+                                "📱 Escolher dos Arquivos / Galeria",
+                                on_click=escolher_do_celular_no_modal,
+                                bgcolor=MULTILOG_NAVY,
+                                height=38,
+                                font_size=12,
+                            ),
+                            ft.Divider(height=1),
+                            ft.Text("Ou escolher foto salva no projeto:", size=11, color=TEXT_MUTED),
                             *(opcoes_botoes if opcoes_botoes else [ft.Text("Nenhuma foto na pasta padrão.", size=11, color=TEXT_SUBTLE)]),
                             ft.Divider(height=1),
                             tf_custom_path,
@@ -2602,6 +3518,13 @@ class MultilogMobileApp:
             if not uid or not nome:
                 self.mostrar_snackbar("Preencha Matrícula/ID e Nome Completo.", erro=True)
                 return
+
+            if rfid_uid:
+                disponivel, msg_rfid = database.verificar_disponibilidade_rfid_usuario(rfid_uid, ignorar_user_id=uid)
+                if not disponivel:
+                    hardware_mock.tocar_buzzer_erro()
+                    self.mostrar_snackbar(msg_rfid, erro=True)
+                    return
 
             foto_destino = ""
             foto_blob_salvar = estado_foto["blob"]
@@ -2797,10 +3720,11 @@ class MultilogMobileApp:
                                             controls=[
                                                 lbl_foto_nome,
                                                 ft.Row(
-                                                    spacing=6,
+                                                    spacing=4,
                                                     controls=[
-                                                        _btn("📷 Foto", on_click=abrir_seletor_fotos_salvas, bgcolor=MULTILOG_BLUE, expand=True, height=34, font_size=11),
-                                                        _btn("✕ Limpar", on_click=lambda e: atualizar_preview("", blob=None, nome_arq=""), bgcolor="#FEE2E2", color="#991B1B", expand=True, height=34, font_size=11),
+                                                        _btn("📱 Celular", on_click=selecionar_foto_do_celular, bgcolor=MULTILOG_NAVY, expand=True, height=34, font_size=11),
+                                                        _btn("📁 Pasta", on_click=abrir_seletor_fotos_salvas, bgcolor=MULTILOG_BLUE, expand=True, height=34, font_size=11),
+                                                        _btn("✕", on_click=lambda e: atualizar_preview("", blob=None, nome_arq=""), bgcolor="#FEE2E2", color="#991B1B", width=36, height=34, font_size=11),
                                                     ],
                                                 ),
                                             ],
