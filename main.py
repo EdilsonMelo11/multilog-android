@@ -325,10 +325,13 @@ class MultilogMobileApp:
                 peca_gaveta = next((p for p in pecas_est if p["posicao_linha"] == r and p["posicao_coluna"] == c), None)
                 if peca_gaveta:
                     rfid_esp = (peca_gaveta.get("rfid_uid") or "").strip()
-                    if rfid_esp:
-                        if tag_fmt == rfid_esp:
-                            return peca_gaveta["nome"]
-                        return "Tag Incorreta!"
+                    if rfid_esp and tag_fmt == rfid_esp:
+                        return peca_gaveta["nome"]
+                # No modo livre/admin: se aproximar tag de outra peça cadastrada, envia o nome dessa peça para o LCD!
+                outra_peca = database.get_peca_por_rfid(tag_fmt)
+                if outra_peca and outra_peca.get("nome"):
+                    return outra_peca["nome"]
+                return "Tag Nao Cadastr."
 
             if self.campo_rfid_modal_ativo is not None:
                 if self.campo_nome_modal_ativo is not None and (self.campo_nome_modal_ativo.value or "").strip():
@@ -620,10 +623,21 @@ class MultilogMobileApp:
             return True
 
         # Modo livre (Admin sem O.S. em execução)
+        if self.slot_selecionado == (r, c):
+            self.deselecionar_gaveta()
+            return True
+
         self.slot_selecionado = (r, c)
         hardware_mock.acender_led(r, c)
         self.renderizar_tela_atual()
         return True
+
+    def deselecionar_gaveta(self):
+        """Deseleciona a gaveta ativa no modo livre/admin e apaga o LED físico."""
+        if not self.esta_em_modo_os_estante():
+            self.slot_selecionado = None
+            hardware_mock.apagar_led()
+            self.renderizar_tela_atual()
 
     # =========================================================================
     # Utilitários de UI (Dialog / Snackbar)
@@ -821,17 +835,32 @@ class MultilogMobileApp:
                                 pass
                             self.mostrar_snackbar(f"✓ Tag RFID correspondente confirmada: '{peca_gaveta['nome']}' (L{r+1}·C{c+1})!")
                             return
+                        elif peca:
+                            # A tag lida é de OUTRA peça cadastrada no catálogo!
+                            # No modo livre/admin: migra a seleção automaticamente para a nova peça sem erro
+                            try:
+                                self.hw.enviar_nome_lcd(peca["nome"])
+                            except Exception:
+                                pass
+                            if peca.get("estante_id") and peca.get("posicao_linha", -1) >= 0 and peca.get("posicao_coluna", -1) >= 0:
+                                self.estante_ativa_id = peca["estante_id"]
+                                self.slot_selecionado = (peca["posicao_linha"], peca["posicao_coluna"])
+                                hardware_mock.acender_led(peca["posicao_linha"], peca["posicao_coluna"])
+                                self.mostrar_snackbar(f"Peça localizada: {peca['nome']} (L{peca['posicao_linha']+1}·C{peca['posicao_coluna']+1})")
+                                self.renderizar_tela_atual()
+                            else:
+                                self.slot_selecionado = None
+                                hardware_mock.apagar_led()
+                                self.mostrar_snackbar(f"Peça localizada no catálogo: {peca['nome']} (#{peca['id']}) [Fora de estante]")
+                                self.renderizar_tela_atual()
+                            return
                         else:
                             hardware_mock.tocar_buzzer_erro()
                             try:
-                                self.hw.enviar_nome_lcd("Tag Incorreta!")
+                                self.hw.enviar_nome_lcd("Tag Nao Cadastr.")
                             except Exception:
                                 pass
-                            nome_lido = peca["nome"] if peca else "Não cadastrada"
-                            self.mostrar_snackbar(
-                                f"❌ Tag RFID Incorreta! A tag lida é de '{nome_lido}', mas a gaveta selecionada contém '{peca_gaveta['nome']}' (L{r+1}·C{c+1})!",
-                                erro=True,
-                            )
+                            self.mostrar_snackbar(f"❌ Tag RFID '{tag_fmt}' não vinculada a nenhuma peça do catálogo!", erro=True)
                             return
 
             # 8. Se a tag não pertence a nenhuma peça do catálogo:
@@ -1891,7 +1920,13 @@ class MultilogMobileApp:
                 content=ft.Column(
                     spacing=6,
                     controls=[
-                        ft.Text(f"Gaveta L{r+1}·C{c+1} Vazia (LED Aceso)", size=13, weight=ft.FontWeight.BOLD, color=MULTILOG_NAVY),
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(f"Gaveta L{r+1}·C{c+1} Vazia (LED Aceso)", size=13, weight=ft.FontWeight.BOLD, color=MULTILOG_NAVY),
+                                _btn("✕", on_click=lambda e: self.deselecionar_gaveta(), bgcolor="#64748B", width=32, height=28),
+                            ],
+                        ),
                         ft.Text("Coloque uma peça do catálogo nesta gaveta ou cadastre uma nova.", size=11, color=TEXT_MUTED),
                         _btn("➕ Adicionar Peça a esta Gaveta", on_click=lambda e: self.abrir_modal_adicionar_peca_gaveta(r, c), bgcolor=MULTILOG_NAVY, height=36),
                     ],
@@ -1908,6 +1943,7 @@ class MultilogMobileApp:
                 controls=[
                     ft.Row(
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
                         controls=[
                             ft.Column(
                                 spacing=1,
@@ -1918,11 +1954,17 @@ class MultilogMobileApp:
                                     ft.Text(f"RFID: {peca.get('rfid_uid') or 'S/ Tag'}", size=10, color=MULTILOG_BLUE),
                                 ],
                             ),
-                            ft.Container(
-                                bgcolor=MULTILOG_NAVY,
-                                border_radius=8,
-                                padding=_pad_sym(10, 6),
-                                content=ft.Text(f"{peca['quantidade_estoque']} un", size=13, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                            ft.Row(
+                                spacing=4,
+                                controls=[
+                                    ft.Container(
+                                        bgcolor=MULTILOG_NAVY,
+                                        border_radius=8,
+                                        padding=_pad_sym(10, 6),
+                                        content=ft.Text(f"{peca['quantidade_estoque']} un", size=13, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                                    ),
+                                    _btn("✕", on_click=lambda e: self.deselecionar_gaveta(), bgcolor="#64748B", width=32, height=32),
+                                ],
                             ),
                         ],
                     ),
