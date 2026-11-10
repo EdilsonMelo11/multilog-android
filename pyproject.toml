@@ -30,6 +30,7 @@ manifest_application = { usesCleartextTraffic = "true" }
 "android.permission.ACCESS_NETWORK_STATE" = true
 "android.permission.ACCESS_WIFI_STATE" = true
 "android.permission.READ_EXTERNAL_STORAGE" = true
+"android.permission.WRITE_EXTERNAL_STORAGE" = true
 "android.permission.READ_MEDIA_IMAGES" = true
 
 [tool.flet.android.gradle_properties]
