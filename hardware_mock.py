@@ -19,11 +19,21 @@ def apagar_led() -> None:
     hw.apagar_led()
     print("[HARDWARE LED] -> APAGAR todos os LEDs.")
 
+def tocar_buzzer_bip() -> None:
+    """Aciona bip simples no buzzer do ESP32 para sinalizar leitura de tag RFID."""
+    hw = hardware_manager.HardwareManager.get_instancia()
+    hw.acionar_buzzer_bip()
+    print("[HARDWARE BUZZER] -> BIP SIMPLES (Leitura de Tag)")
+
 def tocar_buzzer_erro() -> None:
-    """Aciona o buzzer de alerta de erro (pino D2) no ESP32 via Serial/Wi-Fi."""
+    """Aciona bip duplo de aviso de erro no buzzer (D2) do ESP32 (tag incorreta ou peso incorreto)."""
     hw = hardware_manager.HardwareManager.get_instancia()
     hw.acionar_buzzer_erro()
-    print("[HARDWARE BUZZER] -> ALERTA SONORO DE ERRO (D2)")
+    print("[HARDWARE BUZZER] -> BIP DUPLO (Alerta de Erro - Tag Incorreta ou Peso Incorreto)")
+
+def tocar_buzzer_duplo() -> None:
+    """Alias para tocar_buzzer_erro."""
+    tocar_buzzer_erro()
 
 def ler_peso_balanca(peso_esperado: float = 0.0) -> Optional[float]:
     """

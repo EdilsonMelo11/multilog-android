@@ -48,6 +48,7 @@ def processar_operacao(
         
     if not validar_peso(peso_medido, float(peca_data['peso_unitario_g']), quantidade_operacao):
         hardware_mock.apagar_led()
+        hardware_mock.tocar_buzzer_erro()
         return False, f"Erro de peso! Esperado ~{peso_esperado_total:.1f}g, Lido: {peso_medido:.1f}g", peca_data
         
     qtd_alteracao = quantidade_operacao if tipo_operacao == "ADICAO" else -quantidade_operacao

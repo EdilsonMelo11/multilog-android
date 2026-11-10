@@ -680,7 +680,7 @@ def upsert_peca(peca_data: Dict[str, Any]) -> None:
         WHERE id = ?
         ''', (
             peca_data.get('nome', 'Desconhecido'),
-            peca_data['tipo'],
+            peca_data.get('tipo', 'Outro'),
             peca_data.get('posicao_linha', -1),
             peca_data.get('posicao_coluna', -1),
             peca_data['peso_unitario_g'],
@@ -697,7 +697,7 @@ def upsert_peca(peca_data: Dict[str, Any]) -> None:
         ''', (
             peca_data['id'],
             peca_data.get('nome', 'Desconhecido'),
-            peca_data['tipo'],
+            peca_data.get('tipo', 'Outro'),
             peca_data.get('posicao_linha', -1),
             peca_data.get('posicao_coluna', -1),
             peca_data['peso_unitario_g'],

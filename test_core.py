@@ -135,6 +135,11 @@ def test_hardware_manager_debounce_lcd_e_buzzer():
         assert achou is True
         assert len(nome_lcd) <= 16
 
+        hw.ultimo_bip_buzzer_ts = 0.0
+        hardware_mock.tocar_buzzer_bip()
+        cmds_bip = hw.consumir_comando_wifi()
+        assert "BUZZER:BIP" in cmds_bip
+
         hw.ultimo_erro_buzzer_ts = 0.0
         hardware_mock.tocar_buzzer_erro()
         cmds = hw.consumir_comando_wifi()
@@ -843,6 +848,117 @@ def test_estante_ampla_com_side_bar_horizontal():
         assert primeiro_card_padrao.expand is True
     finally:
         database.excluir_estante(temp_id)
+
+
+def test_buzzer_bip_leitura_e_bip_duplo_erro():
+    """
+    Testa a regra de negócio do Buzzer:
+    1. A cada passagem de tag RFID: emite 1 bip simples de confirmação de leitura.
+    2. Quando a tag for errada (não cadastrada ou não correspondente na O.S.): emite bip duplo de erro.
+    3. Quando o peso for incorreto/divergente: emite bip duplo de erro.
+    """
+    bips_simples = 0
+    bips_duplos = 0
+
+    orig_bip = hardware_mock.tocar_buzzer_bip
+    orig_erro = hardware_mock.tocar_buzzer_erro
+
+    def _spy_bip():
+        nonlocal bips_simples
+        bips_simples += 1
+        orig_bip()
+
+    def _spy_erro():
+        nonlocal bips_duplos
+        bips_duplos += 1
+        orig_erro()
+
+    hardware_mock.tocar_buzzer_bip = _spy_bip
+    hardware_mock.tocar_buzzer_erro = _spy_erro
+
+    dummy_page = DummyPage()
+    app = main.MultilogMobileApp(dummy_page)
+    app.funcionario_id = "1001"
+    app.usuario_role = "OPERARIO"
+
+    try:
+        # Prepara peças para teste
+        tag_correta = "A1 B2 C3 D4"
+        tag_errada = "F9 E8 D7 C6"
+        database.vincular_rfid_peca(101, tag_correta)
+        database.vincular_rfid_peca(102, tag_errada)
+
+        # 1. Leitura de tag avulsa não cadastrada
+        bips_simples = 0
+        bips_duplos = 0
+        app._ultimo_rfid_ui_tag = ""
+        app._ultimo_rfid_ui_ts = 0.0
+        app._on_rfid_recebido("99 99 99 99")
+        # Deve emitir 1 bip simples de leitura + 1 bip duplo de erro (tag não cadastrada)
+        assert bips_simples == 1
+        assert bips_duplos == 1
+
+        # 2. Inicia uma O.S. esperando a peça 101
+        oid = database.criar_ordem_servico(
+            "OS Teste Buzzer",
+            [{"peca_id": 101, "tipo_operacao": "REMOCAO", "quantidade": 2}],
+            operador_id="1001",
+            estante_id=1,
+        )
+        ordens = database.get_ordens_servico_abertas("1001")
+        os_obj = next(o for o in ordens if o["id"] == oid)
+        app.iniciar_execucao_os(os_obj)
+
+        # 2a. Operador passa a tag ERRADA (peça 102) durante a O.S.
+        bips_simples = 0
+        bips_duplos = 0
+        app._ultimo_rfid_ui_tag = ""
+        app._ultimo_rfid_ui_ts = 0.0
+        app._on_rfid_recebido(tag_errada)
+        assert bips_simples == 1
+        assert bips_duplos == 1
+        assert app.rfid_os_validado is False
+
+        # 2b. Operador passa a tag CORRETA (peça 101) durante a O.S.
+        bips_simples = 0
+        bips_duplos = 0
+        app._ultimo_rfid_ui_tag = ""
+        app._ultimo_rfid_ui_ts = 0.0
+        app._on_rfid_recebido(tag_correta)
+        assert bips_simples == 1
+        assert bips_duplos == 0
+        assert app.rfid_os_validado is True
+
+        # 3. Teste de PESO INCORRETO na O.S. e na movimentação
+        peca_101 = database.get_peca(101)
+        peso_unit = float(peca_101["peso_unitario_g"])
+        peso_errado = (peso_unit * 2) * 0.5  # 50% divergente (fora da tolerância de ±5%)
+
+        # Renderiza modal de execução da O.S.
+        app.renderizar_tela_atual()
+        assert not logic.validar_peso(peso_errado, peso_unit, 2)
+
+        # Valida que logic.processar_operacao emite o bip duplo ao detectar erro de peso
+        dados_op = {
+            "id": 101,
+            "nome": peca_101["nome"],
+            "tipo": peca_101.get("tipo", "Fixação"),
+            "peso_unitario_g": peso_unit,
+            "quantidade": 2,
+            "posicao_linha": peca_101["posicao_linha"],
+            "posicao_coluna": peca_101["posicao_coluna"],
+        }
+        bips_duplos = 0
+        sucesso_peso, msg_peso, _ = logic.processar_operacao("1001", dados_op, "REMOCAO", peso_informado=peso_errado)
+        assert sucesso_peso is False
+        assert "Erro de peso" in msg_peso
+        assert bips_duplos == 1
+
+    finally:
+        hardware_mock.tocar_buzzer_bip = orig_bip
+        hardware_mock.tocar_buzzer_erro = orig_erro
+        app.os_ativa = None
+
 
 
 

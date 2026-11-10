@@ -103,10 +103,14 @@ class _ESP32RequestHandler(BaseHTTPRequestHandler):
             return
 
         if rota == "/api/buzzer":
-            # Permite acionar o buzzer remotamente via HTTP se necessário
+            # Permite acionar o buzzer remotamente via HTTP (bip simples ou bip duplo de erro)
+            tipo = params.get("tipo", ["ERRO"])[0].upper()
             if hw:
-                hw.acionar_buzzer_erro()
-            self._responder_json(200, {"ok": True, "buzzer": "ERRO"})
+                if tipo in ("BIP", "SIMPLES", "TAG", "OK"):
+                    hw.acionar_buzzer_bip()
+                else:
+                    hw.acionar_buzzer_erro()
+            self._responder_json(200, {"ok": True, "buzzer": tipo})
             return
 
         self._responder_json(404, {"ok": False, "error": "Rota nao encontrada"})
@@ -155,6 +159,7 @@ class HardwareManager:
         self._ultimo_rfid_notificado_ts: float = 0.0
         self.janela_dedup_rfid_s: float = 2.0
         self.ultimo_erro_buzzer_ts: float = 0.0
+        self.ultimo_bip_buzzer_ts: float = 0.0
         self.resolver_nome_custom: Optional[Callable[[str], Optional[str]]] = None
 
     @classmethod
@@ -575,13 +580,25 @@ class HardwareManager:
             except Exception:
                 pass
 
-    def acionar_buzzer_erro(self):
-        """Aciona o buzzer sonoro no pino D2 do ESP32 (com cooldown de 1.2s para não saturar)."""
+    def acionar_buzzer_bip(self):
+        """Aciona um bip simples no buzzer do ESP32 ao passar qualquer tag RFID (cooldown de 0.25s)."""
         agora = time.time()
-        if (agora - self.ultimo_erro_buzzer_ts) < 1.2:
+        if (agora - self.ultimo_bip_buzzer_ts) < 0.25:
+            return
+        self.ultimo_bip_buzzer_ts = agora
+        self.enviar_comando("BUZZER:BIP")
+
+    def acionar_buzzer_erro(self):
+        """Aciona o bip duplo de erro no buzzer (D2) no ESP32 (cooldown de 0.8s para não saturar)."""
+        agora = time.time()
+        if (agora - self.ultimo_erro_buzzer_ts) < 0.8:
             return
         self.ultimo_erro_buzzer_ts = agora
         self.enviar_comando("BUZZER:ERRO")
+
+    def acionar_buzzer_duplo(self):
+        """Alias para acionar_buzzer_erro (bip duplo de erro: tag incorreta ou peso incorreto)."""
+        self.acionar_buzzer_erro()
 
     def ler_ultimo_peso(self) -> float:
         return self.ultimo_peso

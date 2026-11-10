@@ -741,6 +741,9 @@ class MultilogMobileApp:
             self._ultimo_rfid_ui_tag = tag_fmt
             self._ultimo_rfid_ui_ts = agora
 
+            # Emite bip simples sonoro de confirmação imediata de leitura de tag RFID
+            hardware_mock.tocar_buzzer_bip()
+
             # 1. Se houver modal de cadastro de peça aberto, preenche o campo de RFID e valida unicidade
             if self.campo_rfid_modal_ativo is not None and self.aba_atual != "usuarios":
                 self.campo_rfid_modal_ativo.value = tag_fmt
@@ -1173,8 +1176,15 @@ class MultilogMobileApp:
                                     height=32,
                                 ),
                                 _btn(
-                                    "🔊 Buzzer D2",
-                                    on_click=lambda e: (hardware_mock.tocar_buzzer_erro(), self.mostrar_snackbar("Alerta sonoro enviado ao pino D2!")),
+                                    "🔔 Bip",
+                                    on_click=lambda e: (hardware_mock.tocar_buzzer_bip(), self.mostrar_snackbar("Bip de leitura enviado ao buzzer!")),
+                                    bgcolor=MULTILOG_CYAN,
+                                    expand=True,
+                                    height=32,
+                                ),
+                                _btn(
+                                    "🔊 Bip Duplo",
+                                    on_click=lambda e: (hardware_mock.tocar_buzzer_erro(), self.mostrar_snackbar("Bip duplo de erro enviado ao buzzer (D2)!")),
                                     bgcolor=ACCENT_ROSE,
                                     expand=True,
                                     height=32,
