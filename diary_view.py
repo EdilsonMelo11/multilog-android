@@ -1,3 +1,6 @@
+import os
+import asyncio
+import inspect
 import flet as ft
 import database
 from typing import Dict, Any, Optional
@@ -88,9 +91,17 @@ def _status_badge_cores(status: str):
     return "#E0F2FE", "#0369A1"
 
 
-def construir_tela_diario(page: ft.Page, mostrar_snackbar) -> ft.Control:
+def construir_tela_diario(page: ft.Page, mostrar_snackbar, file_picker: Optional[Any] = None) -> ft.Control:
     """Constrói a visão mobile vertical 20:9 de Diário de Movimentações, Auditoria de O.S. e Extrato por Gaveta."""
     aba_ativa = {"idx": 0}
+
+    # Procura seletor de arquivos (SAF / FilePicker) para salvar no celular/desktop
+    fp = file_picker
+    if fp is None and hasattr(ft, "FilePicker"):
+        for c in (getattr(page, "services", []) or []) + (getattr(page, "overlay", []) or []):
+            if isinstance(c, ft.FilePicker):
+                fp = c
+                break
 
     # --- Filtros Aba 1: Movimentações ---
     dd_op_mov = ft.Dropdown(
@@ -556,9 +567,198 @@ def construir_tela_diario(page: ft.Page, mostrar_snackbar) -> ft.Control:
         renderizar_aba()
         page.update()
 
+    def abrir_modal_exportar():
+        async def executar_exportacao(tipo: str, dlg_alvo: ft.AlertDialog):
+            try:
+                caminho = None
+                nome_rel = ""
+                if tipo == "MOVS":
+                    filtros = {
+                        "funcionario_id": dd_op_mov.value or "TODOS",
+                        "tipo_operacao": dd_tipo_mov.value or "TODAS",
+                        "busca": (tf_busca_mov.value or "").strip(),
+                    }
+                    caminho = database.exportar_diario_csv(filtros=filtros)
+                    nome_rel = "Histórico de Movimentações"
+                elif tipo == "OS":
+                    filtros = {
+                        "status": dd_status_os.value or "TODOS",
+                        "busca": (tf_busca_os.value or "").strip(),
+                    }
+                    caminho = database.exportar_auditoria_os_csv(filtros=filtros)
+                    nome_rel = "Auditoria de Ordens de Serviço"
+                elif tipo == "EXTRATO":
+                    data_sel = dd_data_ext.value
+                    try:
+                        est_sel = int(dd_estante_ext.value or 1)
+                    except Exception:
+                        est_sel = 1
+                    caminho = database.exportar_extrato_gavetas_csv(data_str=data_sel, estante_id=est_sel)
+                    nome_rel = "Extrato de Gavetas"
+                elif tipo == "TUDO":
+                    caminho = database.exportar_relatorio_completo_csv()
+                    nome_rel = "Relatório Completo (Tudo)"
+
+                fechar_dialogo(dlg_alvo)
+
+                nome_arq = os.path.basename(caminho) if caminho else "planilha.csv"
+                src_bytes = None
+                if caminho and os.path.exists(caminho):
+                    try:
+                        with open(caminho, "rb") as f:
+                            src_bytes = f.read()
+                    except Exception:
+                        pass
+
+                # Cópia direta para pasta Downloads pública do celular
+                copiado_celular, caminho_celular = database.salvar_em_armazenamento_celular(caminho)
+
+                # Se o seletor nativo estiver disponível (Android SAF / Desktop), permite salvar onde quiser
+                caminho_salvo_usuario = None
+                if fp is not None and hasattr(fp, "save_file") and src_bytes:
+                    try:
+                        custom_type = getattr(getattr(ft, "FilePickerFileType", None), "CUSTOM", None)
+                        res = fp.save_file(
+                            dialog_title="Salvar Planilha no Celular / Dispositivo",
+                            file_name=nome_arq,
+                            file_type=custom_type or ft.FilePickerFileType.ANY,
+                            allowed_extensions=["csv"],
+                            src_bytes=src_bytes,
+                        )
+                        if inspect.isawaitable(res):
+                            caminho_salvo_usuario = await res
+                        else:
+                            caminho_salvo_usuario = res
+                    except Exception as ex_fp:
+                        print(f"[Export] Fallback FilePicker save_file: {ex_fp}")
+
+                if caminho_salvo_usuario:
+                    mostrar_snackbar(f"✅ {nome_rel} salvo com sucesso no celular/dispositivo!\nArquivo: {nome_arq}")
+                elif copiado_celular and caminho_celular:
+                    nome_dest = os.path.basename(caminho_celular)
+                    mostrar_snackbar(f"✅ {nome_rel} salvo no celular (Downloads)!\nArquivo: {nome_dest}")
+                else:
+                    mostrar_snackbar(f"✅ {nome_rel} exportado com sucesso!\nSalvo em: {nome_arq}")
+            except Exception as ex:
+                fechar_dialogo(dlg_alvo)
+                mostrar_snackbar(f"❌ Erro ao exportar planilha: {ex}", erro=True)
+
+        def acionar_exportacao(tipo_id: str):
+            if hasattr(page, "run_task") and callable(page.run_task):
+                try:
+                    page.run_task(executar_exportacao, tipo_id, dlg_export)
+                    return
+                except Exception:
+                    pass
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(executar_exportacao(tipo_id, dlg_export))
+            except RuntimeError:
+                asyncio.run(executar_exportacao(tipo_id, dlg_export))
+            except Exception:
+                pass
+
+        def criar_opcao_card(titulo: str, desc: str, icone: str, tipo_id: str, cor_destaque: str = MULTILOG_NAVY):
+            return ft.Container(
+                bgcolor=BG_ELEVATED,
+                border=_border_all(1, BORDER_SUBTLE),
+                border_radius=8,
+                padding=10,
+                ink=True,
+                on_click=lambda e: acionar_exportacao(tipo_id),
+                content=ft.Row(
+                    spacing=10,
+                    alignment=ft.MainAxisAlignment.START,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Text(icone, size=20),
+                        ft.Column(
+                            spacing=2,
+                            expand=True,
+                            controls=[
+                                ft.Text(titulo, size=12, weight=ft.FontWeight.BOLD, color=cor_destaque),
+                                ft.Text(desc, size=10, color=TEXT_MUTED),
+                            ],
+                        ),
+                        ft.Text("➔", size=13, color=TEXT_MUTED),
+                    ],
+                ),
+            )
+
+        dlg_export = ft.AlertDialog(
+            modal=True,
+            title=ft.Row(
+                spacing=8,
+                controls=[
+                    ft.Text("📥", size=18),
+                    ft.Text("Exportar Planilhas (CSV)", size=14, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+                ],
+            ),
+            content=ft.Container(
+                width=320,
+                content=ft.Column(
+                    tight=True,
+                    spacing=8,
+                    controls=[
+                        ft.Text(
+                            "Gera arquivos .CSV compatíveis com Excel/Sheets e salva diretamente no armazenamento do celular (Downloads).",
+                            size=10,
+                            color=TEXT_MUTED,
+                        ),
+                        criar_opcao_card(
+                            "Movimentações",
+                            "Histórico de entradas e saídas com filtros atuais.",
+                            "📜",
+                            "MOVS",
+                        ),
+                        criar_opcao_card(
+                            "Auditoria de O.S.",
+                            "Status, prazos e conferência de itens das ordens.",
+                            "🔍",
+                            "OS",
+                        ),
+                        criar_opcao_card(
+                            "Extrato de Gavetas",
+                            "Entradas, saídas e saldo líquido por posição.",
+                            "📦",
+                            "EXTRATO",
+                        ),
+                        criar_opcao_card(
+                            "Relatório Completo (Tudo)",
+                            "Consolida estoque atual, O.S. e últimas movimentações.",
+                            "📊",
+                            "TUDO",
+                            cor_destaque=ACCENT_EMERALD,
+                        ),
+                    ],
+                ),
+            ),
+            actions=[
+                ft.TextButton("Cancelar", on_click=lambda e: fechar_dialogo(dlg_export)),
+            ],
+        )
+        abrir_dialogo(dlg_export)
+
     btn_aba_0 = _btn("📜 Movs", on_click=lambda e: selecionar_aba(0), expand=True, height=36, font_size=12)
     btn_aba_1 = _btn("🔍 O.S.", on_click=lambda e: selecionar_aba(1), expand=True, height=36, font_size=12)
     btn_aba_2 = _btn("📦 Extrato", on_click=lambda e: selecionar_aba(2), expand=True, height=36, font_size=12)
+
+    btn_exportar = _btn(
+        "📥 Exportar",
+        on_click=lambda e: abrir_modal_exportar(),
+        bgcolor=ACCENT_EMERALD,
+        height=32,
+        font_size=11,
+    )
+
+    header_row = ft.Row(
+        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[
+            ft.Text("Diário e Auditoria", size=16, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+            btn_exportar,
+        ],
+    )
 
     def atualizar_botoes_abas():
         for i, b in enumerate([btn_aba_0, btn_aba_1, btn_aba_2]):
@@ -570,6 +770,14 @@ def construir_tela_diario(page: ft.Page, mostrar_snackbar) -> ft.Control:
                 b.content.color = cor_txt
 
     carregar_opcoes_filtros()
+    if hasattr(dd_op_mov, "on_select"):
+        dd_op_mov.on_select = lambda e: (atualizar_aba_movimentacoes(), page.update())
+        dd_tipo_mov.on_select = lambda e: (atualizar_aba_movimentacoes(), page.update())
+        dd_status_os.on_select = lambda e: (atualizar_aba_auditoria(), page.update())
+        dd_data_ext.on_select = lambda e: (atualizar_aba_extrato(), page.update())
+        dd_estante_ext.on_select = lambda e: (atualizar_aba_extrato(), page.update())
+    if hasattr(sw_vazias_ext, "on_change"):
+        sw_vazias_ext.on_change = lambda e: (atualizar_aba_extrato(), page.update())
     atualizar_botoes_abas()
     renderizar_aba()
 
@@ -577,7 +785,7 @@ def construir_tela_diario(page: ft.Page, mostrar_snackbar) -> ft.Control:
         expand=True,
         spacing=8,
         controls=[
-            ft.Text("Diário e Auditoria", size=16, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+            header_row,
             ft.Row(spacing=4, controls=[btn_aba_0, btn_aba_1, btn_aba_2]),
             container_conteudo,
         ],

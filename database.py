@@ -62,6 +62,11 @@ def _init_and_sync_funcionarios_db(conn_estoque: Optional[sqlite3.Connection] = 
     conn_f = sqlite3.connect(func_db)
     conn_f.row_factory = sqlite3.Row
     cur_f = conn_f.cursor()
+    try:
+        cur_f.execute("PRAGMA journal_mode=WAL;")
+        cur_f.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
     cur_f.execute('''
     CREATE TABLE IF NOT EXISTS funcionarios (
         id TEXT PRIMARY KEY,
@@ -156,6 +161,11 @@ def init_db() -> None:
     """Inicializa o banco de dados e cria as tabelas se não existirem."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
     
     # Tabela de Estantes Físicas
     cursor.execute('''
@@ -1219,7 +1229,49 @@ def get_detalhes_conciliacao_os(ordem_id: int) -> Dict[str, Any]:
         'movimentacoes_realizadas': movimentacoes
     }
 
-def exportar_diario_csv(caminho_arquivo: str, filtros: Optional[Dict[str, Any]] = None) -> str:
+def obter_diretorio_exportacoes() -> str:
+    """Retorna e garante a existência da pasta de exportações de planilhas."""
+    pasta_base = os.path.dirname(os.path.abspath(DB_PATH))
+    pasta_export = os.path.join(pasta_base, "exportacoes")
+    os.makedirs(pasta_export, exist_ok=True)
+    return pasta_export
+
+def salvar_em_armazenamento_celular(caminho_arquivo: str, pastas_customizadas: Optional[List[str]] = None) -> Tuple[bool, Optional[str]]:
+    """
+    Tenta copiar o arquivo exportado para o armazenamento público acessível do celular Android
+    (ex: pasta /storage/emulated/0/Download ou /sdcard/Download) para que apareça diretamente
+    no aplicativo 'Meus Arquivos' ou 'Downloads' do smartphone.
+    Retorna (True, caminho_destino) se copiado com sucesso, ou (False, None).
+    """
+    if not caminho_arquivo or not os.path.exists(caminho_arquivo):
+        return False, None
+
+    nome_arq = os.path.basename(caminho_arquivo)
+    pastas_candidatas = pastas_customizadas or [
+        "/storage/emulated/0/Download",
+        "/sdcard/Download",
+        "/storage/emulated/0/Documents",
+        "/sdcard/Documents",
+        "/storage/self/primary/Download",
+    ]
+
+    for pasta in pastas_candidatas:
+        try:
+            if os.path.exists(pasta) and os.path.isdir(pasta):
+                destino = os.path.join(pasta, nome_arq)
+                if os.path.abspath(destino) == os.path.abspath(caminho_arquivo):
+                    return True, destino
+                shutil.copy2(caminho_arquivo, destino)
+                return True, destino
+        except Exception:
+            continue
+
+    return False, None
+
+def exportar_diario_csv(caminho_arquivo: Optional[str] = None, filtros: Optional[Dict[str, Any]] = None) -> str:
+    if not caminho_arquivo:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        caminho_arquivo = os.path.join(obter_diretorio_exportacoes(), f"multilog_movimentacoes_{ts}.csv")
     diario = get_diario_movimentacoes(filtros)
     cabecalho = [
         "Data/Hora", "ID Mov.", "Tipo", "Qtd. Movimentada", "Qtd. Planejada O.S.",
@@ -1247,6 +1299,137 @@ def exportar_diario_csv(caminho_arquivo: str, filtros: Optional[Dict[str, Any]] 
                 d.get('ordem_status', '') or '',
                 d.get('ordem_prazo', '') or ''
             ])
+    salvar_em_armazenamento_celular(caminho_arquivo)
+    return caminho_arquivo
+
+def exportar_auditoria_os_csv(caminho_arquivo: Optional[str] = None, filtros: Optional[Dict[str, Any]] = None) -> str:
+    if not caminho_arquivo:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        caminho_arquivo = os.path.join(obter_diretorio_exportacoes(), f"multilog_auditoria_os_{ts}.csv")
+    ordens = get_auditoria_ordens_servico(filtros)
+    cabecalho = [
+        "ID O.S.", "Título", "Status", "Operador ID", "Nome Operador",
+        "Estante ID", "Data Criação", "Prazo Limite", "Data Conclusão",
+        "Total Itens Planejados", "Total Itens Atendidos"
+    ]
+    with open(caminho_arquivo, mode='w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerow(cabecalho)
+        for o in ordens:
+            writer.writerow([
+                o.get('id', ''),
+                o.get('titulo', ''),
+                o.get('status_calculado', ''),
+                o.get('operador_id', ''),
+                o.get('operador_nome', '') or f"Operador {o.get('operador_id', '')}",
+                o.get('estante_id', ''),
+                o.get('data_criacao', ''),
+                o.get('prazo_limite', '') or '-',
+                o.get('data_conclusao', '') or '-',
+                o.get('total_planejado', 0),
+                o.get('total_atendido', 0)
+            ])
+    salvar_em_armazenamento_celular(caminho_arquivo)
+    return caminho_arquivo
+
+def exportar_extrato_gavetas_csv(caminho_arquivo: Optional[str] = None, data_str: Optional[str] = None, estante_id: int = 1) -> str:
+    if not caminho_arquivo:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        caminho_arquivo = os.path.join(obter_diretorio_exportacoes(), f"multilog_extrato_gavetas_{ts}.csv")
+    if not data_str:
+        datas = get_datas_com_movimentacoes()
+        data_str = datas[0] if datas else datetime.now().strftime("%Y-%m-%d")
+    extrato = get_extrato_caixas_por_dia(data_str, estante_id=estante_id, incluir_vazias=True)
+    cabecalho = [
+        "Data", "Estante ID", "Posição Linha", "Posição Coluna", "Identificador Gaveta",
+        "ID Peça", "Nome Peça", "Tipo Peça",
+        "Entradas (+)", "Saídas (-)", "Saldo Líquido", "Total Movimentações"
+    ]
+    with open(caminho_arquivo, mode='w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerow(cabecalho)
+        for e in extrato:
+            writer.writerow([
+                data_str,
+                e.get('estante_id', estante_id),
+                e.get('posicao_linha', 0) + 1,
+                e.get('posicao_coluna', 0) + 1,
+                e.get('identificador_gaveta', ''),
+                e.get('peca_id', '') or '-',
+                e.get('peca_nome', '') or 'Vazia',
+                e.get('peca_tipo', '') or '-',
+                e.get('total_entradas', 0),
+                e.get('total_saidas', 0),
+                e.get('saldo_liquido', 0),
+                e.get('total_movimentacoes', 0)
+            ])
+    salvar_em_armazenamento_celular(caminho_arquivo)
+    return caminho_arquivo
+
+def exportar_relatorio_completo_csv(caminho_arquivo: Optional[str] = None) -> str:
+    if not caminho_arquivo:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        caminho_arquivo = os.path.join(obter_diretorio_exportacoes(), f"multilog_relatorio_completo_{ts}.csv")
+    with open(caminho_arquivo, mode='w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f, delimiter=';')
+        
+        # --- SEÇÃO 1: ESTOQUE ATUAL ---
+        writer.writerow(["=== RELATÓRIO GERAL MULTILOG - ESTOQUE ATUAL ==="])
+        writer.writerow(["Data Geração:", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        writer.writerow([])
+        writer.writerow(["ID Peça", "Nome Peça", "Categoria", "Estante", "Posição (L·C)", "Estoque Atual (un)", "Peso Unit (g)", "RFID"])
+        pecas = get_todas_pecas()
+        for p in pecas:
+            pos = f"L{p.get('posicao_linha', 0)+1}·C{p.get('posicao_coluna', 0)+1}" if p.get('posicao_linha', -1) >= 0 else "Fora de estante"
+            writer.writerow([
+                p.get('id', ''),
+                p.get('nome', ''),
+                p.get('tipo', ''),
+                p.get('estante_nome', 'Estante'),
+                pos,
+                p.get('quantidade_estoque', 0),
+                p.get('peso_unitario_g', 0.0),
+                p.get('rfid_uid', '') or 'Sem Tag'
+            ])
+        writer.writerow([])
+        writer.writerow([])
+        
+        # --- SEÇÃO 2: AUDITORIA DE ORDENS DE SERVIÇO ---
+        writer.writerow(["=== AUDITORIA DE ORDENS DE SERVIÇO ==="])
+        writer.writerow(["ID O.S.", "Título", "Status", "Operador", "Data Criação", "Prazo Limite", "Data Conclusão", "Itens Planejados", "Itens Atendidos"])
+        ordens = get_auditoria_ordens_servico()
+        for o in ordens:
+            writer.writerow([
+                o.get('id', ''),
+                o.get('titulo', ''),
+                o.get('status_calculado', ''),
+                o.get('operador_nome', '') or o.get('operador_id', ''),
+                o.get('data_criacao', ''),
+                o.get('prazo_limite', '') or '-',
+                o.get('data_conclusao', '') or '-',
+                o.get('total_planejado', 0),
+                o.get('total_atendido', 0)
+            ])
+        writer.writerow([])
+        writer.writerow([])
+        
+        # --- SEÇÃO 3: HISTÓRICO COMPLETO DE MOVIMENTAÇÕES ---
+        writer.writerow(["=== HISTÓRICO DE MOVIMENTAÇÕES ==="])
+        writer.writerow(["Data/Hora", "ID Mov.", "Tipo", "Quantidade", "ID Peça", "Nome Peça", "Operador", "ID O.S.", "Título O.S."])
+        diario = get_diario_movimentacoes()
+        for d in diario:
+            writer.writerow([
+                d.get('data_hora', ''),
+                d.get('id', ''),
+                d.get('tipo_operacao', ''),
+                d.get('quantidade', ''),
+                d.get('peca_id', ''),
+                d.get('peca_nome', '') or 'Peça Desconhecida',
+                d.get('funcionario_nome', '') or d.get('funcionario_id', ''),
+                d.get('ordem_id', '') or '',
+                d.get('ordem_titulo', '') or ''
+            ])
+    salvar_em_armazenamento_celular(caminho_arquivo)
     return caminho_arquivo
 
 def get_datas_com_movimentacoes() -> List[str]:

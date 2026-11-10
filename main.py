@@ -1,4 +1,5 @@
 import os
+import asyncio
 import inspect
 import shutil
 import threading
@@ -228,6 +229,7 @@ class MultilogMobileApp:
         self.rfid_os_validado: bool = False
         self.ordenacao_os: str = "RECENTE"  # RECENTE | ANTIGA | AZ | ZA
         self.filtro_busca_catalogo: str = ""
+        self.catalogo_expandido: bool = False  # Colapsado por padrão na tela de estantes
 
         # Pisca-pisca (500ms) da posição ativa na Estante durante O.S.
         self.blink_state: bool = False
@@ -265,6 +267,18 @@ class MultilogMobileApp:
         self.hw.registrar_callback_peso(self._on_peso_recebido)
         self.hw.iniciar_monitoramento_background()
 
+        def on_disconnect_cliente(e=None):
+            try:
+                self.hw.desregistrar_callback_rfid(self._on_rfid_recebido)
+                self.hw.desregistrar_callback_peso(self._on_peso_recebido)
+            except Exception:
+                pass
+
+        if hasattr(self.page, "on_disconnect"):
+            self.page.on_disconnect = on_disconnect_cliente
+        if hasattr(self.page, "on_close"):
+            self.page.on_close = on_disconnect_cliente
+
         # Inicia thread leve de pisca-pisca para a gaveta ativa da O.S.
         self._thread_pisca = threading.Thread(target=self._loop_pisca_estante, daemon=True)
         self._thread_pisca.start()
@@ -275,12 +289,19 @@ class MultilogMobileApp:
         self.badge_usuario_header = ft.Row(spacing=6, visible=False)
         self.container_principal = ft.Container(expand=True, padding=_pad_sym(10, 8))
         self.barra_navegacao = ft.Row(spacing=4)
+        nav_conteudo = ft.Container(
+            padding=_pad_sym(6, 5),
+            content=self.barra_navegacao,
+        )
         self.wrapper_navegacao = ft.Container(
             bgcolor=BG_CARD,
             border=_border_all(1, BORDER_SUBTLE),
-            padding=_pad_sym(6, 5),
             visible=False,
-            content=self.barra_navegacao,
+            content=ft.SafeArea(
+                content=nav_conteudo,
+                avoid_intrusions_top=False,
+                avoid_intrusions_bottom=True,
+            ) if hasattr(ft, "SafeArea") else nav_conteudo,
         )
 
         self._montar_layout_base()
@@ -907,8 +928,7 @@ class MultilogMobileApp:
             visible=False,
         )
 
-        header = ft.Container(
-            bgcolor=MULTILOG_NAVY,
+        header_conteudo = ft.Container(
             padding=_pad_sym(10, 7),
             content=ft.Row(
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -947,17 +967,36 @@ class MultilogMobileApp:
             ),
         )
 
-        self.page.add(
-            ft.Column(
-                expand=True,
-                spacing=0,
-                controls=[
-                    header,
-                    self.container_principal,
-                    self.wrapper_navegacao,
-                ],
-            )
+        header = ft.Container(
+            bgcolor=MULTILOG_NAVY,
+            content=ft.SafeArea(
+                content=header_conteudo,
+                avoid_intrusions_top=True,
+                avoid_intrusions_bottom=False,
+            ) if hasattr(ft, "SafeArea") else header_conteudo,
         )
+
+        coluna_raiz = ft.Column(
+            expand=True,
+            spacing=0,
+            controls=[
+                header,
+                self.container_principal,
+                self.wrapper_navegacao,
+            ],
+        )
+
+        if hasattr(ft, "SafeArea"):
+            self.page.add(
+                ft.SafeArea(
+                    content=coluna_raiz,
+                    expand=True,
+                    avoid_intrusions_top=False,
+                    avoid_intrusions_bottom=True,
+                )
+            )
+        else:
+            self.page.add(coluna_raiz)
 
     def _ir_para_aba_ordens(self):
         if self.os_ativa is not None:
@@ -1037,7 +1076,9 @@ class MultilogMobileApp:
         elif self.aba_atual == "usuarios":
             self.container_principal.content = self._construir_tela_usuarios()
         elif self.aba_atual == "diario":
-            self.container_principal.content = construir_tela_diario(self.page, self.mostrar_snackbar)
+            self.container_principal.content = construir_tela_diario(
+                self.page, self.mostrar_snackbar, file_picker=self.file_picker
+            )
         self.page.update()
 
     # =========================================================================
@@ -1495,7 +1536,9 @@ class MultilogMobileApp:
             )
 
         # Constrói matriz de gavetas adaptada para largura 20:9
+        estante_ampla = (colunas > 3)
         matriz_col = ft.Column(spacing=4 if compacto else 6)
+        self.matriz_col_atual = matriz_col
         for r in range(linhas):
             row_slots = ft.Row(spacing=4 if compacto else 6)
             for c in range(colunas):
@@ -1592,15 +1635,21 @@ class MultilogMobileApp:
                         ],
                     )
 
-                card_slot = ft.Container(
-                    expand=True,
-                    bgcolor=bg,
-                    border=borda,
-                    border_radius=8,
-                    padding=5 if compacto else 8,
-                    on_click=lambda e, rr=r, cc=c: self.tentar_selecionar_gaveta_estante(rr, cc),
-                    content=conteudo_card,
-                )
+                kwargs_slot = {
+                    "bgcolor": bg,
+                    "border": borda,
+                    "border_radius": 8,
+                    "padding": 5 if compacto else 8,
+                    "on_click": lambda e, rr=r, cc=c: self.tentar_selecionar_gaveta_estante(rr, cc),
+                    "content": conteudo_card,
+                }
+                if estante_ampla:
+                    kwargs_slot["width"] = 115
+                    kwargs_slot["expand"] = False
+                else:
+                    kwargs_slot["expand"] = True
+
+                card_slot = ft.Container(**kwargs_slot)
 
                 if eh_slot_ativo_os:
                     self._slot_ativo_container = card_slot
@@ -1620,27 +1669,111 @@ class MultilogMobileApp:
             else "Toque na gaveta para acender o LED"
         )
 
-        controls_tela = [
-            barra_topo_estante,
-            ft.Container(
-                bgcolor=BG_CARD,
+        if estante_ampla:
+            matriz_scroll = ft.Row(
+                scroll=ft.ScrollMode.ALWAYS,
+                controls=[matriz_col],
+            )
+
+            def acionar_rolagem(delta: float):
+                async def _rolar():
+                    try:
+                        res = matriz_scroll.scroll_to(delta=delta, duration=250)
+                        if inspect.isawaitable(res):
+                            await res
+                    except Exception:
+                        pass
+
+                if hasattr(self.page, "run_task") and callable(self.page.run_task):
+                    try:
+                        self.page.run_task(_rolar)
+                        return
+                    except Exception:
+                        pass
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(_rolar())
+                except RuntimeError:
+                    try:
+                        asyncio.run(_rolar())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            barra_scroll_inferior = ft.Container(
+                bgcolor=BG_ELEVATED,
                 border=_border_all(1, BORDER_SUBTLE),
-                border_radius=12,
-                padding=8,
-                content=ft.Column(
-                    spacing=6,
+                border_radius=8,
+                padding=_pad_sym(6, 4),
+                content=ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
+                        _btn(
+                            "◀",
+                            on_click=lambda e: acionar_rolagem(-140),
+                            bgcolor=MULTILOG_NAVY,
+                            width=36,
+                            height=28,
+                            font_size=12,
+                        ),
                         ft.Row(
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            spacing=4,
+                            alignment=ft.MainAxisAlignment.CENTER,
                             controls=[
-                                ft.Text(f"{estante_atual['nome']} ({linhas}×{colunas})", size=12, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
-                                ft.Text(legenda_texto, size=9, color=TEXT_MUTED),
+                                ft.Text("↔", size=13, color=MULTILOG_CYAN, weight=ft.FontWeight.BOLD),
+                                ft.Text(f"Estante Ampla · {colunas} Colunas (Deslize para ver mais)", size=10, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
                             ],
                         ),
-                        matriz_col,
+                        _btn(
+                            "▶",
+                            on_click=lambda e: acionar_rolagem(140),
+                            bgcolor=MULTILOG_NAVY,
+                            width=36,
+                            height=28,
+                            font_size=12,
+                        ),
                     ],
                 ),
+            )
+            controles_card_matriz = [
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    controls=[
+                        ft.Text(f"{estante_atual['nome']} ({linhas}×{colunas})", size=12, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+                        ft.Text(legenda_texto, size=9, color=TEXT_MUTED),
+                    ],
+                ),
+                matriz_scroll,
+                barra_scroll_inferior,
+            ]
+        else:
+            controles_card_matriz = [
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    controls=[
+                        ft.Text(f"{estante_atual['nome']} ({linhas}×{colunas})", size=12, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+                        ft.Text(legenda_texto, size=9, color=TEXT_MUTED),
+                    ],
+                ),
+                matriz_col,
+            ]
+
+        card_matriz = ft.Container(
+            bgcolor=BG_CARD,
+            border=_border_all(1, BORDER_SUBTLE),
+            border_radius=12,
+            padding=8,
+            content=ft.Column(
+                spacing=6,
+                controls=controles_card_matriz,
             ),
+        )
+
+        controls_tela = [
+            barra_topo_estante,
+            card_matriz,
             painel_inferior,
         ]
         if not modo_os:
@@ -2146,6 +2279,60 @@ class MultilogMobileApp:
 
     def _construir_secao_catalogo_pecas(self) -> ft.Control:
         todas = database.get_todas_pecas()
+        expandido = getattr(self, "catalogo_expandido", False)
+
+        def alternar_expansao(e):
+            self.catalogo_expandido = not getattr(self, "catalogo_expandido", False)
+            self.renderizar_tela_atual()
+
+        btn_toggle = _btn(
+            "▲ Recolher" if expandido else "▼ Expandir",
+            on_click=alternar_expansao,
+            bgcolor=MULTILOG_NAVY if expandido else "#475569",
+            height=30,
+            font_size=11,
+        )
+
+        header_row = ft.Row(
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            controls=[
+                ft.Row(
+                    spacing=6,
+                    controls=[
+                        ft.Text("📋 Peças Cadastradas", size=13, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
+                        ft.Container(
+                            bgcolor=MULTILOG_NAVY,
+                            border_radius=6,
+                            padding=_pad_sym(6, 2),
+                            content=ft.Text(f"{len(todas)}", size=10, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                        ),
+                    ],
+                ),
+                ft.Row(
+                    spacing=6,
+                    controls=[
+                        _btn(
+                            "+ Nova Peça",
+                            on_click=lambda e: self.abrir_modal_cadastro_peca_catalogo(),
+                            bgcolor=MULTILOG_NAVY,
+                            height=30,
+                            font_size=11,
+                        ) if expandido else ft.Container(),
+                        btn_toggle,
+                    ],
+                ),
+            ],
+        )
+
+        if not expandido:
+            return ft.Container(
+                bgcolor=BG_CARD,
+                border=_border_all(1, BORDER_SUBTLE),
+                border_radius=12,
+                padding=10,
+                on_click=alternar_expansao,
+                content=header_row,
+            )
 
         filtro = getattr(self, "filtro_busca_catalogo", "").strip().lower()
         if filtro:
@@ -2306,30 +2493,7 @@ class MultilogMobileApp:
             content=ft.Column(
                 spacing=8,
                 controls=[
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        controls=[
-                            ft.Row(
-                                spacing=4,
-                                controls=[
-                                    ft.Text("📋 Peças Cadastradas", size=13, weight=ft.FontWeight.BOLD, color=TEXT_MAIN),
-                                    ft.Container(
-                                        bgcolor=MULTILOG_NAVY,
-                                        border_radius=6,
-                                        padding=_pad_sym(5, 1),
-                                        content=ft.Text(f"{len(todas)}", size=10, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
-                                    ),
-                                ],
-                            ),
-                            _btn(
-                                "+ Nova Peça",
-                                on_click=lambda e: self.abrir_modal_cadastro_peca_catalogo(),
-                                bgcolor=MULTILOG_NAVY,
-                                height=30,
-                                font_size=11,
-                            ),
-                        ],
-                    ),
+                    header_row,
                     ft.Text(
                         "Catálogo geral de peças do sistema (adicionar / remover novas peças da lista).",
                         size=10,
@@ -2458,6 +2622,7 @@ class MultilogMobileApp:
                 self.mostrar_snackbar(f"Peça '{nome}' cadastrada na lista!")
 
             self.fechar_dialogo(dlg)
+            self.catalogo_expandido = True
             self.renderizar_tela_atual()
 
         dlg = ft.AlertDialog(
@@ -3799,7 +3964,31 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    if hasattr(ft, "run"):
-        ft.run(main)
+    import sys
+
+    args = sys.argv[1:]
+    is_server = "--server" in args or "--web" in args or os.environ.get("MULTILOG_SERVER") == "1"
+
+    if is_server:
+        port = 8550
+        for i, a in enumerate(args):
+            if a in ("--port", "-p") and i + 1 < len(args):
+                try:
+                    port = int(args[i + 1])
+                except ValueError:
+                    pass
+        print("=" * 60)
+        print("🚀 MULTILOG SERVER INICIADO (Multi-Usuário Concorrente)")
+        print(f"📡 Porta: {port}")
+        print("📱 Abra no navegador de qualquer celular ou PC na rede:")
+        print(f"   http://<IP_DO_COMPUTADOR>:{port}")
+        print("=" * 60)
+        if hasattr(ft, "run"):
+            ft.run(main, host="0.0.0.0", port=port, view=None)
+        else:
+            ft.app(target=main, host="0.0.0.0", port=port, view=ft.AppView.WEB_BROWSER)
     else:
-        ft.app(target=main)
+        if hasattr(ft, "run"):
+            ft.run(main)
+        else:
+            ft.app(target=main)
